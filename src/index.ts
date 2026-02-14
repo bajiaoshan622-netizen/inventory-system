@@ -459,30 +459,269 @@ app.get('/api/admin/stats', jwtAuth, async (c) => {
 
 // ========== 图片上传 ==========
 
-// 获取预签名上传 URL
+function sanitizeFilename(filename: string): string {
+  return (filename || 'upload.jpg').replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+// 获取上传 URL（由 Worker 代理写入 R2，避免伪“预签名”）
 app.post('/api/upload/url', apiKeyAuth, async (c) => {
-  const bucket = c.env.BUCKET;
   const { filename } = await c.req.json();
-  
-  // 生成唯一文件名
-  const key = `images/${Date.now()}_${filename}`;
-  
-  // 创建 R2 对象（这里简化为直接返回公开访问 URL）
-  // 实际生产环境应该实现真正的预签名 URL
-  await bucket.put(key, new Uint8Array(0), {
-    httpMetadata: { contentType: 'image/jpeg' }
+  const safeFilename = sanitizeFilename(filename);
+  const key = `images/${Date.now()}_${safeFilename}`;
+
+  return c.json({
+    uploadUrl: `/api/upload/${key}`,
+    uploadMethod: 'PUT',
+    publicUrl: `/api/files/${key}`,
+    key
   });
-  
-  const url = `https://${c.env.BUCKET.name}.r2.cloudflarestorage.com/${key}`;
-  
-  return c.json({ 
-    uploadUrl: url,
-    publicUrl: url,
-    key 
+});
+
+// 通过 Worker 上传到 R2（Agent 使用）
+app.put('/api/upload/*', apiKeyAuth, async (c) => {
+  const bucket = c.env.BUCKET;
+  const key = c.req.path.replace('/api/upload/', '');
+
+  if (!key) {
+    return c.json({ error: 'Invalid upload key' }, 400);
+  }
+
+  const contentType = c.req.header('Content-Type') || 'application/octet-stream';
+  const body = await c.req.raw.arrayBuffer();
+
+  if (!body || body.byteLength === 0) {
+    return c.json({ error: 'Empty file body' }, 400);
+  }
+
+  await bucket.put(key, body, {
+    httpMetadata: { contentType }
   });
+
+  return c.json({
+    uploaded: true,
+    key,
+    publicUrl: `/api/files/${key}`
+  });
+});
+
+// 通过 Worker 读取 R2 文件
+app.get('/api/files/*', async (c) => {
+  const bucket = c.env.BUCKET;
+  const key = c.req.path.replace('/api/files/', '');
+
+  if (!key) {
+    return c.json({ error: 'Invalid file key' }, 400);
+  }
+
+  const obj = await bucket.get(key);
+  if (!obj) {
+    return c.json({ error: 'File not found' }, 404);
+  }
+
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set('etag', obj.httpEtag);
+  return new Response(obj.body, { headers });
 });
 
 // 健康检查
 app.get('/api/health', (c) => c.json({ status: 'ok' }));
+
+// 前端页面 - 根路径返回 HTML
+app.get('/', (c) => {
+  return c.html(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>库存管理系统 - 管理员</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+    .header { background: white; padding: 16px 24px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .header h1 { font-size: 20px; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+    .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .stat-value { font-size: 28px; font-weight: 600; color: #1890ff; }
+    .stat-label { font-size: 14px; color: #666; margin-top: 4px; }
+    .toolbar { background: white; padding: 16px; border-radius: 8px; margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }
+    input, select, button { padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; }
+    .btn { background: #1890ff; color: white; border: none; cursor: pointer; }
+    .btn-danger { background: #ff4d4f; }
+    .btn-success { background: #52c41a; }
+    .table-container { background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #f0f0f0; }
+    th { background: #fafafa; }
+    .tag { padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #e6f7ff; color: #1890ff; }
+    .tag.pending { background: #fff7e6; color: #fa8c16; }
+    .tag.approved { background: #f6ffed; color: #52c41a; }
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; }
+    .modal.show { display: flex; align-items: center; justify-content: center; }
+    .modal-content { background: white; padding: 24px; border-radius: 8px; width: 90%; max-width: 600px; max-height: 90vh; overflow-y: auto; }
+    .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    const API_BASE = '/api';
+    let token = localStorage.getItem('admin_token');
+    
+    // 简单的路由
+    if (!token) {
+      showLogin();
+    } else {
+      showMain();
+    }
+    
+    function showLogin() {
+      document.getElementById('app').innerHTML = \`
+        <div class="login-container">
+          <div class="login-box">
+            <h2 style="margin-bottom: 24px; text-align: center;">🔐 管理员登录</h2>
+            <form id="loginForm">
+              <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 8px; font-size: 14px; color: #666;">密码</label>
+                <input type="password" id="password" placeholder="请输入密码" required style="width: 100%;">
+              </div>
+              <button type="submit" class="btn" style="width: 100%;">登录</button>
+            </form>
+          </div>
+        </div>
+      \`;
+      
+      document.getElementById('loginForm').onsubmit = async (e) => {
+        e.preventDefault();
+        const password = document.getElementById('password').value;
+        const res = await fetch(\`\${API_BASE}/auth/login\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (data.token) {
+          token = data.token;
+          localStorage.setItem('admin_token', token);
+          showMain();
+        } else {
+          alert('密码错误');
+        }
+      };
+    }
+    
+    function showMain() {
+      document.getElementById('app').innerHTML = \`
+        <div class="container">
+          <div class="header">
+            <h1>📦 库存管理系统</h1>
+            <div>
+              <button class="btn btn-danger" onclick="logout()">退出</button>
+            </div>
+          </div>
+          <div class="stats">
+            <div class="stat-card"><div class="stat-value" id="totalCount">-</div><div class="stat-label">总记录数</div></div>
+            <div class="stat-card"><div class="stat-value" id="pendingCount" style="color: #fa8c16;">-</div><div class="stat-label">待复核</div></div>
+            <div class="stat-card"><div class="stat-value" id="approvedCount" style="color: #52c41a;">-</div><div class="stat-label">已确认</div></div>
+            <div class="stat-card"><div class="stat-value" id="totalWeight">-</div><div class="stat-label">总重量(吨)</div></div>
+          </div>
+          <div class="toolbar">
+            <input type="text" id="searchVehicle" placeholder="搜索车牌号...">
+            <select id="filterBatch">
+              <option value="">全部包装</option>
+              <option value="1号袋">1号袋</option>
+              <option value="2号袋">2号袋</option>
+              <option value="3号袋">3号袋</option>
+            </select>
+            <button class="btn" onclick="loadData()">🔍 查询</button>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr><th>ID</th><th>入库日期</th><th>车号</th><th>包装</th><th>实收件数</th><th>实收吨数</th><th>状态</th><th>操作</th></tr>
+              </thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      \`;
+      loadStats();
+      loadData();
+    }
+    
+    async function loadStats() {
+      const res = await fetch(\`\${API_BASE}/admin/stats\`, {
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      const data = await res.json();
+      document.getElementById('totalCount').textContent = data.total_records || 0;
+      document.getElementById('pendingCount').textContent = data.pending_count || 0;
+      document.getElementById('approvedCount').textContent = data.approved_count || 0;
+      document.getElementById('totalWeight').textContent = (data.total_weight || 0).toFixed(2);
+    }
+    
+    async function loadData() {
+      const vehicle = document.getElementById('searchVehicle')?.value?.trim() || '';
+      const batch = document.getElementById('filterBatch')?.value || '';
+      const params = new URLSearchParams();
+      if (vehicle) params.set('vehicle', vehicle);
+      if (batch) params.set('batch', batch);
+
+      const url = \`\${API_BASE}/admin/records\${params.toString() ? ('?' + params.toString()) : ''}\`;
+      const res = await fetch(url, {
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      const { data } = await res.json();
+      const tbody = document.getElementById('tableBody');
+      tbody.innerHTML = data.map(row => \`
+        <tr>
+          <td>\${row.id}</td>
+          <td>\${row.inbound_date || '-'}</td>
+          <td>\${row.vehicle_id}</td>
+          <td><span class="tag">\${row.package_batch}</span></td>
+          <td>\${row.actual_quantity}</td>
+          <td>\${row.actual_weight}</td>
+          <td><span class="tag \${row.status}">\${row.status === 'pending_review' ? '待复核' : '已确认'}</span></td>
+          <td>
+            \${row.status === 'pending_review' ? 
+              \`<button class="btn btn-success" onclick="approve(\${row.id})" style="padding: 4px 8px; font-size: 12px;">通过</button>
+                <button class="btn btn-danger" onclick="reject(\${row.id})" style="padding: 4px 8px; font-size: 12px;">驳回</button>\` : 
+              '-'
+            }
+          </td>
+        </tr>
+      \`).join('');
+    }
+    
+    async function approve(id) {
+      if (!confirm('确认通过？')) return;
+      await fetch(\`\${API_BASE}/admin/records/\${id}/approve\`, {
+        method: 'POST',
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      loadData();
+      loadStats();
+    }
+    
+    async function reject(id) {
+      if (!confirm('确认驳回？这将删除记录。')) return;
+      await fetch(\`\${API_BASE}/admin/records/\${id}/reject\`, {
+        method: 'POST',
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      loadData();
+      loadStats();
+    }
+    
+    function logout() {
+      localStorage.removeItem('admin_token');
+      location.reload();
+    }
+  </script>
+</body>
+</html>`);
+});
 
 export default app;
