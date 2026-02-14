@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>库存管理系统 - 管理员</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+    
+    /* 登录页 */
+    .login-container {
+      display: flex; align-items: center; justify-content: center; min-height: 100vh;
+    }
+    .login-box {
+      background: white; padding: 40px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%; max-width: 400px;
+    }
+    .login-box h2 { margin-bottom: 24px; text-align: center; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; margin-bottom: 8px; font-size: 14px; color: #666; }
+    .form-group input {
+      width: 100%; padding: 10px 12px; border: 1px solid #d9d9d9;
+      border-radius: 4px; font-size: 14px;
+    }
+    .btn {
+      width: 100%; padding: 12px; background: #1890ff; color: white;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
+    }
+    .btn:hover { background: #40a9ff; }
+    .btn-danger { background: #ff4d4f; }
+    .btn-danger:hover { background: #ff7875; }
+    .btn-success { background: #52c41a; }
+    .btn-success:hover { background: #73d13d; }
+    .btn-warning { background: #fa8c16; }
+    
+    /* 主界面 */
+    .header {
+      background: white; padding: 16px 24px; border-radius: 8px;
+      margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    .header h1 { font-size: 20px; }
+    .header-actions { display: flex; gap: 12px; }
+    
+    /* 统计卡片 */
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+    .stat-card {
+      background: white; padding: 20px; border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    .stat-value { font-size: 28px; font-weight: 600; color: #1890ff; }
+    .stat-label { font-size: 14px; color: #666; margin-top: 4px; }
+    .stat-card.pending .stat-value { color: #fa8c16; }
+    .stat-card.approved .stat-value { color: #52c41a; }
+    
+    /* 筛选栏 */
+    .toolbar {
+      background: white; padding: 16px; border-radius: 8px;
+      margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    .toolbar input, .toolbar select {
+      padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px;
+    }
+    
+    /* Tab */
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+    .tab {
+      padding: 10px 20px; background: white; border: none; border-radius: 4px;
+      cursor: pointer; font-size: 14px;
+    }
+    .tab.active { background: #1890ff; color: white; }
+    
+    /* 表格 */
+    .table-container {
+      background: white; border-radius: 8px; overflow: hidden;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #f0f0f0; }
+    th { background: #fafafa; font-weight: 500; }
+    tr:hover { background: #fafafa; }
+    .tag {
+      padding: 2px 8px; border-radius: 4px; font-size: 12px;
+      background: #e6f7ff; color: #1890ff;
+    }
+    .tag.pending { background: #fff7e6; color: #fa8c16; }
+    .tag.approved { background: #f6ffed; color: #52c41a; }
+    .actions { display: flex; gap: 8px; }
+    .actions button { padding: 4px 12px; font-size: 12px; border: none; border-radius: 4px; cursor: pointer; }
+    
+    /* 图片预览 */
+    .img-thumb { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; cursor: pointer; }
+    
+    /* 弹窗 */
+    .modal {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.5); z-index: 100; align-items: center; justify-content: center;
+    }
+    .modal.show { display: flex; }
+    .modal-content {
+      background: white; padding: 24px; border-radius: 8px;
+      width: 90%; max-width: 600px; max-height: 90vh; overflow-y: auto;
+    }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    .modal-header h3 { margin: 0; }
+    .close-btn { background: none; border: none; font-size: 20px; cursor: pointer; }
+    
+    /* 导入 */
+    .import-area { margin-top: 16px; }
+    .import-area textarea {
+      width: 100%; height: 200px; padding: 12px; border: 1px solid #d9d9d9;
+      border-radius: 4px; font-family: monospace; font-size: 13px;
+    }
+    
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <!-- 登录页 -->
+  <div id="loginPage" class="login-container">
+    <div class="login-box">
+      <h2>🔐 管理员登录</h2>
+      <form id="loginForm">
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" id="password" placeholder="请输入密码" required>
+        </div>
+        <button type="submit" class="btn">登录</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="mainPage" class="container hidden">
+    <div class="header">
+      <h1>📦 库存管理系统</h1>
+      <div class="header-actions">
+        <button class="btn" onclick="showImportModal()" style="width: auto; padding: 8px 16px;">📥 批量导入</button>
+        <button class="btn btn-success" onclick="exportData()" style="width: auto; padding: 8px 16px;">📤 导出Excel</button>
+        <button class="btn btn-danger" onclick="logout()" style="width: auto; padding: 8px 16px;">退出</button>
+      </div>
+    </div>
+
+    <!-- 统计 -->
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-value" id="totalCount">-</div>
+        <div class="stat-label">总记录数</div>
+      </div>
+      <div class="stat-card pending">
+        <div class="stat-value" id="pendingCount">-</div>
+        <div class="stat-label">待复核</div>
+      </div>
+      <div class="stat-card approved">
+        <div class="stat-value" id="approvedCount">-</div>
+        <div class="stat-label">已确认</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="totalWeight">-</div>
+        <div class="stat-label">总重量(吨)</div>
+      </div>
+    </div>
+
+    <!-- 筛选 -->
+    <div class="toolbar">
+      <input type="text" id="searchVehicle" placeholder="搜索车牌号...">
+      <select id="filterBatch">
+        <option value="">全部包装</option>
+        <option value="1号袋">1号袋</option>
+        <option value="2号袋">2号袋</option>
+        <option value="3号袋">3号袋</option>
+        <option value="4号袋">4号袋</option>
+        <option value="6号袋">6号袋</option>
+      </select>
+      <input type="date" id="startDate" placeholder="开始日期">
+      <input type="date" id="endDate" placeholder="结束日期">
+      <button class="btn" onclick="loadData()" style="width: auto; padding: 8px 16px;">🔍 查询</button>
+    </div>
+
+    <!-- Tab -->
+    <div class="tabs">
+      <button class="tab active" onclick="setTab('all')">全部</button>
+      <button class="tab" onclick="setTab('pending_review')">待复核</button>
+      <button class="tab" onclick="setTab('approved')">已确认</button>
+    </div>
+
+    <!-- 表格 -->
+    <div class="table-container">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>入库日期</th>
+            <th>车号</th>
+            <th>包装/批号</th>
+            <th>实收件数</th>
+            <th>实收吨数</th>
+            <th>提单号</th>
+            <th>状态</th>
+            <th>图片</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 详情弹窗 -->
+  <div id="detailModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>记录详情</h3>
+        <button class="close-btn" onclick="closeModal('detailModal')">&times;</button>
+      </div>
+      <div id="detailContent"></div>
+      <div class="actions" style="margin-top: 20px; justify-content: flex-end;">
+        <button id="rejectBtn" class="btn btn-danger" onclick="rejectRecord()">驳回并删除</button>
+        <button id="approveBtn" class="btn btn-success" onclick="approveRecord()">复核通过</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 导入弹窗 -->
+  <div id="importModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>批量导入历史数据</h3>
+        <button class="close-btn" onclick="closeModal('importModal')">&times;</button>
+      </div>
+      <p>格式：JSON 数组，每行一个对象</p>
+      <div class="import-area">
+        <textarea id="importData" placeholder='[
+  {
+    "vehicle_id": "桂P58838",
+    "package_batch": "天宝英文3号袋",
+    "inbound_date": "2026-02-10",
+    "actual_quantity": 700,
+    "actual_weight": 35.11
+  }
+]'></textarea>
+      </div>
+      <div class="actions" style="margin-top: 16px;">
+        <button class="btn btn-success" onclick="importData()">确认导入</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 图片预览 -->
+  <div id="imageModal" class="modal" onclick="closeModal('imageModal')">
+    <div style="max-width: 90%; max-height: 90%;">
+      <img id="previewImage" src="" style="max-width: 100%; max-height: 90vh; border-radius: 8px;">
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = '/api';
+    let token = localStorage.getItem('admin_token');
+    let currentTab = 'all';
+    let currentRecord = null;
+
+    // 检查登录状态
+    if (token) {
+      showMainPage();
+    }
+
+    // 登录
+    document.getElementById('loginForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const password = document.getElementById('password').value;
+      
+      const res = await fetch(`${API_BASE}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password })
+      });
+      
+      const data = await res.json();
+      if (data.token) {
+        token = data.token;
+        localStorage.setItem('admin_token', token);
+        showMainPage();
+      } else {
+        alert('密码错误');
+      }
+    };
+
+    function showMainPage() {
+      document.getElementById('loginPage').classList.add('hidden');
+      document.getElementById('mainPage').classList.remove('hidden');
+      loadStats();
+      loadData();
+    }
+
+    function logout() {
+      localStorage.removeItem('admin_token');
+      token = null;
+      location.reload();
+    }
+
+    async function loadStats() {
+      const res = await fetch(`${API_BASE}/admin/stats`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await res.json();
+      document.getElementById('totalCount').textContent = data.total_records || 0;
+      document.getElementById('pendingCount').textContent = data.pending_count || 0;
+      document.getElementById('approvedCount').textContent = data.approved_count || 0;
+      document.getElementById('totalWeight').textContent = (data.total_weight || 0).toFixed(2);
+    }
+
+    async function loadData() {
+      const params = new URLSearchParams();
+      if (currentTab !== 'all') params.append('status', currentTab);
+      
+      const vehicle = document.getElementById('searchVehicle').value;
+      const batch = document.getElementById('filterBatch').value;
+      const start = document.getElementById('startDate').value;
+      const end = document.getElementById('endDate').value;
+      
+      if (vehicle) params.append('vehicle', vehicle);
+      if (batch) params.append('batch', batch);
+      if (start) params.append('startDate', start);
+      if (end) params.append('endDate', end);
+      
+      const res = await fetch(`${API_BASE}/admin/records?${params}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const { data } = await res.json();
+      
+      const tbody = document.getElementById('tableBody');
+      tbody.innerHTML = data.map(row => `
+        <tr>
+          <td>${row.id}</td>
+          <td>${row.inbound_date || '-'}</td>
+          <td>${row.vehicle_id}</td>
+          <td><span class="tag">${row.package_batch}</span></td>
+          <td>${row.actual_quantity}</td>
+          <td>${row.actual_weight}</td>
+          <td>${row.bill_of_lading || '-'}</td>
+          <td><span class="tag ${row.status}">${row.status === 'pending_review' ? '待复核' : '已确认'}</span></td>
+          <td>${row.image_url ? `<img src="${row.image_url}" class="img-thumb" onclick="showImage('${row.image_url}')">` : '-'}</td>
+          <td class="actions">
+            <button onclick="showDetail(${row.id})" class="btn" style="width: auto; padding: 4px 12px;">查看</button>
+            ${row.status === 'pending_review' ? `
+              <button onclick="approveRecord(${row.id})" class="btn btn-success" style="width: auto; padding: 4px 12px;">通过</button>
+              <button onclick="rejectRecord(${row.id})" class="btn btn-danger" style="width: auto; padding: 4px 12px;">驳回</button>
+            ` : ''}
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function setTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      event.target.classList.add('active');
+      loadData();
+    }
+
+    async function showDetail(id) {
+      const res = await fetch(`${API_BASE}/admin/records/${id}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      currentRecord = await res.json();
+      
+      const content = document.getElementById('detailContent');
+      content.innerHTML = `
+        <p><strong>ID:</strong> ${currentRecord.id}</p>
+        <p><strong>车号:</strong> ${currentRecord.vehicle_id}</p>
+        <p><strong>包装:</strong> ${currentRecord.package_batch}</p>
+        <p><strong>入库日期:</strong> ${currentRecord.inbound_date}</p>
+        <p><strong>实收:</strong> ${currentRecord.actual_quantity}件 / ${currentRecord.actual_weight}吨</p>
+        <p><strong>提单号:</strong> ${currentRecord.bill_of_lading || '-'}</p>
+        <p><strong>合同号:</strong> ${currentRecord.contract_no || '-'}</p>
+        <p><strong>备注:</strong> ${currentRecord.remarks || '-'}</p>
+        <p><strong>状态:</strong> ${currentRecord.status === 'pending_review' ? '待复核' : '已确认'}</p>
+        <p><strong>创建时间:</strong> ${currentRecord.created_at}</p>
+        ${currentRecord.image_url ? `<p><img src="${currentRecord.image_url}" style="max-width: 100%; border-radius: 4px; margin-top: 10px;"></p>` : ''}
+      `;
+      
+      // 根据状态显示/隐藏按钮
+      const approveBtn = document.getElementById('approveBtn');
+      const rejectBtn = document.getElementById('rejectBtn');
+      if (currentRecord.status === 'pending_review') {
+        approveBtn.style.display = 'inline-block';
+        rejectBtn.style.display = 'inline-block';
+      } else {
+        approveBtn.style.display = 'none';
+        rejectBtn.style.display = 'none';
+      }
+      
+      document.getElementById('detailModal').classList.add('show');
+    }
+
+    async function approveRecord(id) {
+      const recordId = id || currentRecord?.id;
+      if (!recordId) return;
+      
+      if (!confirm('确认复核通过这条记录？')) return;
+      
+      await fetch(`${API_BASE}/admin/records/${recordId}/approve`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      
+      closeModal('detailModal');
+      loadData();
+      loadStats();
+    }
+
+    async function rejectRecord(id) {
+      const recordId = id || currentRecord?.id;
+      if (!recordId) return;
+      
+      if (!confirm('确认驳回这条记录？这将永久删除该记录。')) return;
+      
+      await fetch(`${API_BASE}/admin/records/${recordId}/reject`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      
+      closeModal('detailModal');
+      loadData();
+      loadStats();
+    }
+
+    function showImportModal() {
+      document.getElementById('importModal').classList.add('show');
+    }
+
+    async function importData() {
+      const text = document.getElementById('importData').value;
+      try {
+        const records = JSON.parse(text);
+        if (!Array.isArray(records)) throw new Error('必须是数组');
+        
+        const res = await fetch(`${API_BASE}/admin/import`, {
+          method: 'POST',
+          headers: { 
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ records })
+        });
+        
+        const data = await res.json();
+        alert(`成功导入 ${data.imported} 条记录`);
+        closeModal('importModal');
+        loadData();
+        loadStats();
+      } catch (e) {
+        alert('格式错误: ' + e.message);
+      }
+    }
+
+    function exportData() {
+      const params = new URLSearchParams();
+      if (currentTab !== 'all') params.append('status', currentTab);
+      
+      window.open(`${API_BASE}/admin/export?${params}`, '_blank');
+    }
+
+    function showImage(url) {
+      document.getElementById('previewImage').src = url;
+      document.getElementById('imageModal').classList.add('show');
+    }
+
+    function closeModal(id) {
+      document.getElementById(id).classList.remove('show');
+    }
+  </script>
+</body>
+</html>
