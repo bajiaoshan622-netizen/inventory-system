@@ -28,10 +28,14 @@
 - `record_history`：单据修改历史（字段级diff）
 - `attachments`：附件元数据（R2 key, uploader, type）
 
-### 2) 库存校验
+### 2) 库存校验与审批
 - 出库时锁定维度：`tenant + category + batch`
 - 校验公式：`可出库件数 >= 本次出库件数`，否则拒绝
 - 可出库件数来源：`inventory_balance.available_qty`
+- 角色审批流：
+  - 管理员创建入库/出库：直接生效
+  - Agent 创建/更新：进入待审批，管理员审批后生效
+- 异常字段（坏/污/湿/短/多/烂）支持后补，后补写入修改历史
 
 ### 3) 通用货类
 - category 挂“字段模板”：
