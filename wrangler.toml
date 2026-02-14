@@ -13,7 +13,7 @@ bucket_name = "inventory-images"
 
 [vars]
 JWT_SECRET = "inv-sys-jwt-secret-2026-change-me"
-AGENT_API_KEY = "inv-agent-key-2026-change-me"
+AGENT_API_KEY = "e50a4620c6d7804a7bd4fd2f4a4a3058fa9df0ccf91caa289618e667fa75966e"
 
 [site]
 bucket = "./public"

@@ -108,8 +108,7 @@ app.post('/api/auth/login', async (c) => {
   const env = c.env;
   
   // 简单密码验证（生产环境应该用 bcrypt）
-  // 默认密码: admin123，建议部署后修改
-  if (password !== 'admin123') {
+  if (password !== 'WfrK1nCvpUgpNtj') {
     return c.json({ error: 'Invalid password' }, 401);
   }
   
