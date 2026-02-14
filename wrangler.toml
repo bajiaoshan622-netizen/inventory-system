@@ -5,15 +5,15 @@ compatibility_date = "2024-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "inventory_db"
-database_id = ""
+database_id = "3bfbc6ae-113c-4169-bbbf-c11b2cdaf0bb"
 
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "inventory-images"
 
 [vars]
-JWT_SECRET = ""
-AGENT_API_KEY = ""
+JWT_SECRET = "inv-sys-jwt-secret-2026-change-me"
+AGENT_API_KEY = "inv-agent-key-2026-change-me"
 
 [site]
 bucket = "./public"
