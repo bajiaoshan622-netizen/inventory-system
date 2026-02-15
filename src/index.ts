@@ -524,6 +524,350 @@ app.get('/api/files/*', async (c) => {
   return new Response(obj.body, { headers });
 });
 
+// ==========================
+// v2 多客户 / 货类 / 入出库
+// ==========================
+
+type Actor = {
+  role: 'admin' | 'agent';
+  id: string;
+};
+
+async function resolveActor(c: any): Promise<Actor> {
+  const auth = c.req.header('Authorization');
+  if (auth && auth.startsWith('Bearer ')) {
+    const token = auth.replace('Bearer ', '');
+    try {
+      const payload = await verifyJWT(token, c.env.JWT_SECRET);
+      if (payload?.role === 'admin') {
+        return { role: 'admin', id: payload.sub || 'admin' };
+      }
+    } catch {}
+  }
+
+  const apiKey = c.req.header('X-API-Key');
+  if (apiKey && apiKey === c.env.AGENT_API_KEY) {
+    return { role: 'agent', id: 'agent' };
+  }
+
+  throw new Error('UNAUTHORIZED');
+}
+
+async function requireActor(c: any, allowed: Array<'admin' | 'agent'>): Promise<Actor | Response> {
+  try {
+    const actor = await resolveActor(c);
+    if (!allowed.includes(actor.role)) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    return actor;
+  } catch {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+}
+
+async function upsertBalance(db: D1Database, tenantId: number, categoryId: number, batchNo: string, qtyDelta: number, weightDelta: number) {
+  const current = await db.prepare(
+    'SELECT id, available_qty, available_weight FROM inventory_balance WHERE tenant_id = ? AND category_id = ? AND batch_no = ?'
+  ).bind(tenantId, categoryId, batchNo).first<any>();
+
+  if (!current) {
+    await db.prepare(
+      'INSERT INTO inventory_balance (tenant_id, category_id, batch_no, available_qty, available_weight) VALUES (?, ?, ?, ?, ?)'
+    ).bind(tenantId, categoryId, batchNo, qtyDelta, weightDelta).run();
+    return;
+  }
+
+  await db.prepare(
+    'UPDATE inventory_balance SET available_qty = ?, available_weight = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
+  ).bind(
+    (current.available_qty || 0) + qtyDelta,
+    (current.available_weight || 0) + weightDelta,
+    current.id
+  ).run();
+}
+
+async function addHistory(db: D1Database, tenantId: number, recordType: string, recordId: number, action: string, beforeObj: any, afterObj: any, operator: string) {
+  await db.prepare(
+    'INSERT INTO record_history (tenant_id, record_type, record_id, action, before_json, after_json, operator) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(
+    tenantId,
+    recordType,
+    recordId,
+    action,
+    beforeObj ? JSON.stringify(beforeObj) : null,
+    afterObj ? JSON.stringify(afterObj) : null,
+    operator
+  ).run();
+}
+
+// Tenants
+app.get('/api/v2/tenants', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const { results } = await c.env.DB.prepare('SELECT * FROM tenants WHERE status = "active" ORDER BY id ASC').all();
+  return c.json({ data: results });
+});
+
+// Categories
+app.get('/api/v2/categories', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = parseInt(c.req.query('tenantId') || '1');
+  const { results } = await c.env.DB.prepare('SELECT * FROM categories WHERE tenant_id = ? AND active = 1 ORDER BY id ASC').bind(tenantId).all();
+  return c.json({ data: results });
+});
+
+app.post('/api/v2/categories', async (c) => {
+  const actor = await requireActor(c, ['admin']);
+  if (actor instanceof Response) return actor;
+  const body = await c.req.json();
+  const tenantId = Number(body.tenant_id || 1);
+  const code = String(body.code || '').trim();
+  const name = String(body.name || '').trim();
+  const fieldSchema = body.field_schema_json || null;
+  if (!code || !name) return c.json({ error: 'code and name are required' }, 400);
+
+  const r = await c.env.DB.prepare(
+    'INSERT INTO categories (tenant_id, code, name, field_schema_json) VALUES (?, ?, ?, ?)'
+  ).bind(tenantId, code, name, fieldSchema ? JSON.stringify(fieldSchema) : null).run();
+
+  return c.json({ id: r.meta.last_row_id, created: true }, 201);
+});
+
+// Inbound create
+app.post('/api/v2/inbound', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const db = c.env.DB;
+  const body = await c.req.json();
+
+  const tenantId = Number(body.tenant_id || 1);
+  const categoryId = Number(body.category_id);
+  const batchNo = String(body.batch_no || '').trim();
+  const actualQty = Number(body.actual_qty || 0);
+  const actualWeight = Number(body.actual_weight || 0);
+  const status = actor.role === 'admin' ? 'approved' : 'pending_review';
+
+  if (!categoryId || !batchNo) return c.json({ error: 'category_id and batch_no are required' }, 400);
+
+  const r = await db.prepare(`
+    INSERT INTO inventory_inbound (
+      tenant_id, category_id, batch_no, vehicle_id, inbound_date,
+      actual_qty, actual_weight, damage_broken, damage_dirty, damage_wet,
+      shortage_qty, extra_qty, rotten_qty, remarks, status, source, created_by,
+      approved_by, approved_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    tenantId,
+    categoryId,
+    batchNo,
+    body.vehicle_id || null,
+    body.inbound_date || null,
+    actualQty,
+    actualWeight,
+    Number(body.damage_broken || 0),
+    Number(body.damage_dirty || 0),
+    Number(body.damage_wet || 0),
+    Number(body.shortage_qty || 0),
+    Number(body.extra_qty || 0),
+    Number(body.rotten_qty || 0),
+    body.remarks || null,
+    status,
+    actor.role,
+    actor.id,
+    actor.role === 'admin' ? actor.id : null,
+    actor.role === 'admin' ? new Date().toISOString() : null,
+  ).run();
+
+  const id = Number(r.meta.last_row_id || 0);
+  await addHistory(db, tenantId, 'inbound', id, 'create', null, body, actor.id);
+
+  if (status === 'approved') {
+    await upsertBalance(db, tenantId, categoryId, batchNo, actualQty, actualWeight);
+  }
+
+  return c.json({ id, status }, 201);
+});
+
+// Inbound update
+app.put('/api/v2/inbound/:id', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const body = await c.req.json();
+
+  const current = await db.prepare('SELECT * FROM inventory_inbound WHERE id = ?').bind(id).first<any>();
+  if (!current) return c.json({ error: 'Not found' }, 404);
+
+  // Agent 更新已审批记录：进入待审批，不调整库存（保持当前已生效库存）
+  const nextStatus = actor.role === 'admin' ? 'approved' : 'pending_review';
+
+  const newActualQty = Number(body.actual_qty ?? current.actual_qty ?? 0);
+  const newActualWeight = Number(body.actual_weight ?? current.actual_weight ?? 0);
+  const newBatchNo = String(body.batch_no ?? current.batch_no ?? '');
+  const newCategoryId = Number(body.category_id ?? current.category_id ?? 0);
+  const newTenantId = Number(body.tenant_id ?? current.tenant_id ?? 1);
+
+  await db.prepare(`
+    UPDATE inventory_inbound SET
+      tenant_id = ?, category_id = ?, batch_no = ?, vehicle_id = ?, inbound_date = ?,
+      actual_qty = ?, actual_weight = ?, damage_broken = ?, damage_dirty = ?, damage_wet = ?,
+      shortage_qty = ?, extra_qty = ?, rotten_qty = ?, remarks = ?, status = ?,
+      approved_by = ?, approved_at = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(
+    newTenantId,
+    newCategoryId,
+    newBatchNo,
+    body.vehicle_id ?? current.vehicle_id,
+    body.inbound_date ?? current.inbound_date,
+    newActualQty,
+    newActualWeight,
+    Number(body.damage_broken ?? current.damage_broken ?? 0),
+    Number(body.damage_dirty ?? current.damage_dirty ?? 0),
+    Number(body.damage_wet ?? current.damage_wet ?? 0),
+    Number(body.shortage_qty ?? current.shortage_qty ?? 0),
+    Number(body.extra_qty ?? current.extra_qty ?? 0),
+    Number(body.rotten_qty ?? current.rotten_qty ?? 0),
+    body.remarks ?? current.remarks,
+    nextStatus,
+    actor.role === 'admin' ? actor.id : null,
+    actor.role === 'admin' ? new Date().toISOString() : null,
+    id
+  ).run();
+
+  await addHistory(db, current.tenant_id, 'inbound', id, 'update', current, body, actor.id);
+
+  if (actor.role === 'admin' && current.status === 'approved') {
+    // 回滚旧库存，再应用新库存
+    await upsertBalance(db, Number(current.tenant_id), Number(current.category_id), String(current.batch_no), -Number(current.actual_qty || 0), -Number(current.actual_weight || 0));
+    await upsertBalance(db, newTenantId, newCategoryId, newBatchNo, newActualQty, newActualWeight);
+  }
+
+  return c.json({ id, status: nextStatus, updated: true });
+});
+
+// Inbound approve/reject
+app.post('/api/v2/inbound/:id/approve', async (c) => {
+  const actor = await requireActor(c, ['admin']);
+  if (actor instanceof Response) return actor;
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const row = await db.prepare('SELECT * FROM inventory_inbound WHERE id = ?').bind(id).first<any>();
+  if (!row) return c.json({ error: 'Not found' }, 404);
+  if (row.status === 'approved') return c.json({ approved: true, already: true });
+
+  await db.prepare('UPDATE inventory_inbound SET status = "approved", approved_by = ?, approved_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(actor.id, new Date().toISOString(), id).run();
+  await upsertBalance(db, Number(row.tenant_id), Number(row.category_id), String(row.batch_no), Number(row.actual_qty || 0), Number(row.actual_weight || 0));
+  await addHistory(db, Number(row.tenant_id), 'inbound', id, 'approve', row, { status: 'approved' }, actor.id);
+  return c.json({ approved: true });
+});
+
+app.post('/api/v2/inbound/:id/reject', async (c) => {
+  const actor = await requireActor(c, ['admin']);
+  if (actor instanceof Response) return actor;
+  const db = c.env.DB;
+  const id = Number(c.req.param('id'));
+  const row = await db.prepare('SELECT * FROM inventory_inbound WHERE id = ?').bind(id).first<any>();
+  if (!row) return c.json({ error: 'Not found' }, 404);
+
+  await db.prepare('UPDATE inventory_inbound SET status = "rejected", approved_by = ?, approved_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(actor.id, new Date().toISOString(), id).run();
+  await addHistory(db, Number(row.tenant_id), 'inbound', id, 'reject', row, { status: 'rejected' }, actor.id);
+  return c.json({ rejected: true });
+});
+
+// Outbound create (admin only, direct effective)
+app.post('/api/v2/outbound', async (c) => {
+  const actor = await requireActor(c, ['admin']);
+  if (actor instanceof Response) return actor;
+  const db = c.env.DB;
+  const body = await c.req.json();
+
+  const tenantId = Number(body.tenant_id || 1);
+  const categoryId = Number(body.category_id);
+  const batchNo = String(body.batch_no || '').trim();
+  const outboundQty = Number(body.outbound_qty || 0);
+  const outboundWeight = Number(body.outbound_weight || 0);
+
+  if (!categoryId || !batchNo || outboundQty <= 0) {
+    return c.json({ error: 'category_id, batch_no, outbound_qty are required' }, 400);
+  }
+
+  const bal = await db.prepare(
+    'SELECT available_qty, available_weight FROM inventory_balance WHERE tenant_id = ? AND category_id = ? AND batch_no = ?'
+  ).bind(tenantId, categoryId, batchNo).first<any>();
+
+  const availableQty = Number(bal?.available_qty || 0);
+  const availableWeight = Number(bal?.available_weight || 0);
+  if (outboundQty > availableQty || outboundWeight > availableWeight) {
+    return c.json({ error: 'Outbound exceeds available inventory' }, 409);
+  }
+
+  const r = await db.prepare(`
+    INSERT INTO inventory_outbound (
+      tenant_id, category_id, batch_no, outbound_date, outbound_qty, outbound_weight,
+      remarks, status, source, created_by, approved_by, approved_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', 'admin', ?, ?, ?)
+  `).bind(
+    tenantId,
+    categoryId,
+    batchNo,
+    body.outbound_date || null,
+    outboundQty,
+    outboundWeight,
+    body.remarks || null,
+    actor.id,
+    actor.id,
+    new Date().toISOString()
+  ).run();
+
+  const id = Number(r.meta.last_row_id || 0);
+  await upsertBalance(db, tenantId, categoryId, batchNo, -outboundQty, -outboundWeight);
+  await addHistory(db, tenantId, 'outbound', id, 'create', null, body, actor.id);
+
+  return c.json({ id, status: 'approved' }, 201);
+});
+
+app.get('/api/v2/balance', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const categoryId = c.req.query('categoryId');
+  const batchNo = c.req.query('batchNo');
+
+  let sql = 'SELECT * FROM inventory_balance WHERE tenant_id = ?';
+  const params: any[] = [tenantId];
+  if (categoryId) {
+    sql += ' AND category_id = ?';
+    params.push(Number(categoryId));
+  }
+  if (batchNo) {
+    sql += ' AND batch_no = ?';
+    params.push(batchNo);
+  }
+  sql += ' ORDER BY category_id, batch_no';
+
+  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+  return c.json({ data: results });
+});
+
+app.get('/api/v2/history', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const recordType = c.req.query('recordType');
+  const recordId = c.req.query('recordId');
+  if (!recordType || !recordId) return c.json({ error: 'recordType and recordId are required' }, 400);
+
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM record_history WHERE record_type = ? AND record_id = ? ORDER BY id DESC'
+  ).bind(recordType, Number(recordId)).all();
+
+  return c.json({ data: results });
+});
+
 // 健康检查
 app.get('/api/health', (c) => c.json({ status: 'ok' }));
 
