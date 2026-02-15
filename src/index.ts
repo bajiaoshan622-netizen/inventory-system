@@ -634,6 +634,65 @@ app.post('/api/v2/categories', async (c) => {
   return c.json({ id: r.meta.last_row_id, created: true }, 201);
 });
 
+// Attachments v2
+app.post('/api/v2/attachments/upload-url', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const body = await c.req.json();
+  const tenantId = Number(body.tenant_id || 1);
+  const fileName = sanitizeFilename(String(body.filename || 'upload.jpg'));
+  const key = `v2/${tenantId}/${Date.now()}_${fileName}`;
+
+  return c.json({
+    uploadUrl: `/api/v2/attachments/upload/${key}`,
+    uploadMethod: 'PUT',
+    key,
+    fileName,
+  });
+});
+
+app.put('/api/v2/attachments/upload/*', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const key = c.req.path.replace('/api/v2/attachments/upload/', '');
+  if (!key) return c.json({ error: 'Invalid upload key' }, 400);
+
+  const contentType = c.req.header('Content-Type') || 'application/octet-stream';
+  const body = await c.req.raw.arrayBuffer();
+  if (!body || body.byteLength === 0) return c.json({ error: 'Empty file body' }, 400);
+
+  await c.env.BUCKET.put(key, body, { httpMetadata: { contentType } });
+  return c.json({ uploaded: true, key, size: body.byteLength });
+});
+
+app.get('/api/v2/attachments/file/*', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const key = c.req.path.replace('/api/v2/attachments/file/', '');
+  const obj = await c.env.BUCKET.get(key);
+  if (!obj) return c.json({ error: 'File not found' }, 404);
+  const headers = new Headers();
+  obj.writeHttpMetadata(headers);
+  headers.set('etag', obj.httpEtag);
+  return new Response(obj.body, { headers });
+});
+
+app.get('/api/v2/attachments', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const recordType = c.req.query('recordType');
+  const recordId = Number(c.req.query('recordId') || 0);
+
+  if (!recordType || !recordId) return c.json({ error: 'recordType and recordId are required' }, 400);
+
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM attachments WHERE tenant_id = ? AND record_type = ? AND record_id = ? ORDER BY id DESC'
+  ).bind(tenantId, recordType, recordId).all();
+
+  return c.json({ data: results });
+});
+
 // Inbound create
 app.post('/api/v2/inbound', async (c) => {
   const actor = await requireActor(c, ['admin', 'agent']);
@@ -649,6 +708,9 @@ app.post('/api/v2/inbound', async (c) => {
   const status = actor.role === 'admin' ? 'approved' : 'pending_review';
 
   if (!categoryId || !batchNo) return c.json({ error: 'category_id and batch_no are required' }, 400);
+  if (actor.role === 'agent' && !body.attachment_key) {
+    return c.json({ error: 'attachment_key is required for agent inbound' }, 400);
+  }
 
   const r = await db.prepare(`
     INSERT INTO inventory_inbound (
@@ -680,6 +742,21 @@ app.post('/api/v2/inbound', async (c) => {
   ).run();
 
   const id = Number(r.meta.last_row_id || 0);
+
+  if (body.attachment_key) {
+    await db.prepare(
+      'INSERT INTO attachments (tenant_id, record_type, record_id, r2_key, file_name, file_size, uploader) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(
+      tenantId,
+      'inbound',
+      id,
+      String(body.attachment_key),
+      body.attachment_name || null,
+      Number(body.attachment_size || 0),
+      actor.id
+    ).run();
+  }
+
   await addHistory(db, tenantId, 'inbound', id, 'create', null, body, actor.id);
 
   if (status === 'approved') {
@@ -829,6 +906,50 @@ app.post('/api/v2/outbound', async (c) => {
   await addHistory(db, tenantId, 'outbound', id, 'create', null, body, actor.id);
 
   return c.json({ id, status: 'approved' }, 201);
+});
+
+app.get('/api/v2/inbound', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const status = c.req.query('status');
+  const categoryId = c.req.query('categoryId');
+  const page = Number(c.req.query('page') || 1);
+  const limit = Math.min(Number(c.req.query('limit') || 20), 100);
+  const offset = (page - 1) * limit;
+
+  let sql = 'SELECT * FROM inventory_inbound WHERE tenant_id = ?';
+  const params: any[] = [tenantId];
+  if (status) { sql += ' AND status = ?'; params.push(status); }
+  if (categoryId) { sql += ' AND category_id = ?'; params.push(Number(categoryId)); }
+  sql += ' ORDER BY id DESC LIMIT ? OFFSET ?';
+  params.push(limit, offset);
+
+  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+  return c.json({ data: results, page, limit });
+});
+
+app.get('/api/v2/inbound/pending', async (c) => {
+  const actor = await requireActor(c, ['admin']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM inventory_inbound WHERE tenant_id = ? AND status = "pending_review" ORDER BY id DESC'
+  ).bind(tenantId).all();
+  return c.json({ data: results });
+});
+
+app.get('/api/v2/outbound', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const page = Number(c.req.query('page') || 1);
+  const limit = Math.min(Number(c.req.query('limit') || 20), 100);
+  const offset = (page - 1) * limit;
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM inventory_outbound WHERE tenant_id = ? ORDER BY id DESC LIMIT ? OFFSET ?'
+  ).bind(tenantId, limit, offset).all();
+  return c.json({ data: results, page, limit });
 });
 
 app.get('/api/v2/balance', async (c) => {
