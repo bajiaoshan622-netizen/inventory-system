@@ -1503,7 +1503,7 @@ app.get('/', (c) => {
         return;
       }
       const urls = data.map(a => \`\${API_BASE}/v2/attachments/file/\${a.r2_key}\`);
-      alert(\`附件数量: \${data.length}\n\` + urls.join('\n'));
+      alert(\`附件数量: \${data.length}\\n\` + urls.join('\\n'));
     }
 
     async function approveV2(id) {
