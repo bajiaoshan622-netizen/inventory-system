@@ -565,6 +565,24 @@ async function requireActor(c: any, allowed: Array<'admin' | 'agent'>): Promise<
   }
 }
 
+function createTraceId(): string {
+  return (globalThis.crypto as any)?.randomUUID?.() || `t_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function logTrace(level: 'info' | 'error', traceId: string, route: string, detail: Record<string, any>) {
+  const payload = { trace_id: traceId, route, ...detail };
+  if (level === 'error') {
+    console.error('[trace]', JSON.stringify(payload));
+  } else {
+    console.log('[trace]', JSON.stringify(payload));
+  }
+}
+
+async function getTableColumns(db: D1Database, tableName: string): Promise<Set<string>> {
+  const { results } = await db.prepare(`PRAGMA table_info(${tableName})`).all<any>();
+  return new Set((results || []).map((r: any) => String(r.name)));
+}
+
 async function upsertBalance(db: D1Database, tenantId: number, categoryId: number, batchNo: string, qtyDelta: number, weightDelta: number) {
   const current = await db.prepare(
     'SELECT id, available_qty, available_weight FROM inventory_balance WHERE tenant_id = ? AND category_id = ? AND batch_no = ?'
@@ -605,6 +623,45 @@ app.get('/api/v2/tenants', async (c) => {
   const actor = await requireActor(c, ['admin', 'agent']);
   if (actor instanceof Response) return actor;
   const { results } = await c.env.DB.prepare('SELECT * FROM tenants WHERE status = "active" ORDER BY id ASC').all();
+  return c.json({ data: results });
+});
+
+// Companies overview (for company list)
+app.get('/api/v2/companies/overview', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const today = new Date().toISOString().slice(0, 10);
+  const { results } = await c.env.DB.prepare(
+    `SELECT t.id, t.name,
+      COALESCE(SUM(b.available_qty), 0) AS stock_qty,
+      COALESCE(SUM(b.available_weight), 0) AS stock_weight,
+      COALESCE((SELECT SUM(i.actual_qty) FROM inventory_inbound i WHERE i.tenant_id = t.id AND i.status = 'approved' AND i.inbound_date = ?), 0) AS today_in_qty,
+      COALESCE((SELECT SUM(i.actual_weight) FROM inventory_inbound i WHERE i.tenant_id = t.id AND i.status = 'approved' AND i.inbound_date = ?), 0) AS today_in_weight,
+      COALESCE((SELECT SUM(o.outbound_qty) FROM inventory_outbound o WHERE o.tenant_id = t.id AND o.outbound_date = ?), 0) AS today_out_qty,
+      COALESCE((SELECT SUM(o.outbound_weight) FROM inventory_outbound o WHERE o.tenant_id = t.id AND o.outbound_date = ?), 0) AS today_out_weight
+     FROM tenants t
+     LEFT JOIN inventory_balance b ON b.tenant_id = t.id
+     WHERE t.status = 'active'
+     GROUP BY t.id, t.name
+     ORDER BY t.id ASC`
+  ).bind(today, today, today, today).all<any>();
+  return c.json({ data: results });
+});
+
+// Stock summary (tenant detail page)
+app.get('/api/v2/stock/summary', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const categoryId = c.req.query('categoryId');
+  let sql = `SELECT b.tenant_id, b.category_id, c.name AS category_name, b.batch_no, b.available_qty, b.available_weight, b.updated_at
+    FROM inventory_balance b
+    LEFT JOIN categories c ON c.id = b.category_id
+    WHERE b.tenant_id = ?`;
+  const params: any[] = [tenantId];
+  if (categoryId) { sql += ' AND b.category_id = ?'; params.push(Number(categoryId)); }
+  sql += ' ORDER BY b.updated_at DESC, b.id DESC';
+  const { results } = await c.env.DB.prepare(sql).bind(...params).all<any>();
   return c.json({ data: results });
 });
 
@@ -953,37 +1010,72 @@ app.get('/api/v2/inbound/pending', async (c) => {
 app.get('/api/v2/inbound/available', async (c) => {
   const actor = await requireActor(c, ['admin', 'agent']);
   if (actor instanceof Response) return actor;
-  const tenantId = Number(c.req.query('tenantId') || 1);
-  const categoryId = Number(c.req.query('categoryId') || 0);
 
-  let sql = `
-    SELECT
-      i.id AS inbound_id,
-      i.tenant_id,
-      i.category_id,
-      c.name AS category_name,
-      i.batch_no,
-      i.inbound_date,
-      i.actual_qty,
-      i.actual_weight,
-      COALESCE(SUM(o.outbound_qty), 0) AS used_qty,
-      COALESCE(SUM(o.outbound_weight), 0) AS used_weight,
-      (i.actual_qty - COALESCE(SUM(o.outbound_qty), 0)) AS remaining_qty,
-      (i.actual_weight - COALESCE(SUM(o.outbound_weight), 0)) AS remaining_weight
-    FROM inventory_inbound i
-    LEFT JOIN inventory_outbound o ON o.inbound_id = i.id
-    LEFT JOIN categories c ON c.id = i.category_id
-    WHERE i.tenant_id = ? AND i.status = 'approved'
-  `;
-  const params: any[] = [tenantId];
-  if (categoryId) {
-    sql += ' AND i.category_id = ?';
-    params.push(categoryId);
+  const traceId = createTraceId();
+  const tenantIdRaw = c.req.query('tenantId') || '1';
+  const categoryIdRaw = c.req.query('categoryId') || '0';
+  const tenantId = Number(tenantIdRaw);
+  const categoryId = Number(categoryIdRaw);
+  const warnings: Array<{ code: string; message: string; count?: number }> = [];
+
+  try {
+    const outboundCols = await getTableColumns(c.env.DB, 'inventory_outbound');
+    const hasInboundId = outboundCols.has('inbound_id');
+    if (!hasInboundId) {
+      warnings.push({ code: 'OUTBOUND_INBOUND_ID_MISSING', message: 'inventory_outbound 缺少 inbound_id，已降级为空结果' });
+      logTrace('error', traceId, '/api/v2/inbound/available', { tenantIdRaw, categoryIdRaw, degraded: true, reason: 'missing inbound_id column' });
+      return c.json({ data: [], meta: { tenant_id: tenantId, degraded: true }, warnings, trace_id: traceId });
+    }
+
+    let sql = `
+      SELECT
+        i.id AS inbound_id,
+        i.tenant_id,
+        i.category_id,
+        COALESCE(c.name, '未分类') AS category_name,
+        i.batch_no,
+        i.inbound_date,
+        i.actual_qty,
+        i.actual_weight,
+        COALESCE(SUM(o.outbound_qty), 0) AS used_qty,
+        COALESCE(SUM(o.outbound_weight), 0) AS used_weight,
+        (i.actual_qty - COALESCE(SUM(o.outbound_qty), 0)) AS remaining_qty,
+        (i.actual_weight - COALESCE(SUM(o.outbound_weight), 0)) AS remaining_weight
+      FROM inventory_inbound i
+      LEFT JOIN inventory_outbound o ON o.inbound_id = i.id
+      LEFT JOIN categories c ON c.id = i.category_id
+      WHERE i.tenant_id = ? AND i.status = 'approved'
+    `;
+    const params: any[] = [tenantId];
+    if (categoryId) {
+      sql += ' AND i.category_id = ?';
+      params.push(categoryId);
+    }
+    sql += ' GROUP BY i.id HAVING remaining_qty > 0 OR remaining_weight > 0 ORDER BY i.inbound_date DESC, i.id DESC';
+
+    const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+
+    const dirty1 = await c.env.DB.prepare('SELECT COUNT(*) AS c FROM inventory_outbound WHERE inbound_id IS NULL').first<any>();
+    const dirty2 = await c.env.DB.prepare('SELECT COUNT(*) AS c FROM inventory_outbound o LEFT JOIN inventory_inbound i ON i.id = o.inbound_id WHERE o.inbound_id IS NOT NULL AND i.id IS NULL').first<any>();
+    const dirty3 = await c.env.DB.prepare('SELECT COUNT(*) AS c FROM inventory_outbound o JOIN inventory_inbound i ON i.id = o.inbound_id WHERE o.tenant_id != i.tenant_id').first<any>();
+    if (Number(dirty1?.c || 0) > 0) warnings.push({ code: 'OUTBOUND_INBOUND_ID_NULL', message: '存在出库记录缺少 inbound_id', count: Number(dirty1?.c || 0) });
+    if (Number(dirty2?.c || 0) > 0) warnings.push({ code: 'OUTBOUND_ORPHAN_REF', message: '存在出库记录关联不存在的入库', count: Number(dirty2?.c || 0) });
+    if (Number(dirty3?.c || 0) > 0) warnings.push({ code: 'OUTBOUND_CROSS_TENANT', message: '存在跨租户关联的出库记录', count: Number(dirty3?.c || 0) });
+
+    logTrace('info', traceId, '/api/v2/inbound/available', {
+      tenantIdRaw, categoryIdRaw, tenantId, categoryId,
+      result_count: (results || []).length,
+      degraded: warnings.length > 0,
+      warnings_count: warnings.length,
+    });
+    return c.json({ data: results, meta: { tenant_id: tenantId, degraded: warnings.length > 0 }, warnings, trace_id: traceId });
+  } catch (error: any) {
+    logTrace('error', traceId, '/api/v2/inbound/available', {
+      tenantIdRaw, categoryIdRaw, tenantId, categoryId,
+      error: String(error?.message || error),
+    });
+    return c.json({ data: [], meta: { tenant_id: tenantId, degraded: true }, warnings: [{ code: 'AVAILABLE_QUERY_FAILED', message: '可出库查询失败，已降级返回空结果' }], trace_id: traceId }, 200);
   }
-  sql += ' GROUP BY i.id HAVING remaining_qty > 0 OR remaining_weight > 0 ORDER BY i.inbound_date DESC, i.id DESC';
-
-  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
-  return c.json({ data: results });
 });
 
 app.get('/api/v2/outbound', async (c) => {
@@ -1025,113 +1117,148 @@ app.get('/api/v2/balance', async (c) => {
 app.get('/api/v2/ledger/inbound-outbound', async (c) => {
   const actor = await requireActor(c, ['admin', 'agent']);
   if (actor instanceof Response) return actor;
+
+  const traceId = createTraceId();
   const db = c.env.DB;
-  const tenantId = Number(c.req.query('tenantId') || 1);
-  const categoryId = Number(c.req.query('categoryId') || 0);
+  const tenantIdRaw = c.req.query('tenantId') || '1';
+  const categoryIdRaw = c.req.query('categoryId') || '0';
+  const tenantId = Number(tenantIdRaw);
+  const categoryId = Number(categoryIdRaw);
+  const warnings: Array<{ code: string; message: string; count?: number }> = [];
 
-  let inboundSql = `
-    SELECT
-      i.id AS inbound_id,
-      i.tenant_id,
-      i.category_id,
-      c.name AS category_name,
-      i.inbound_date,
-      i.vehicle_id,
-      i.batch_no,
-      i.actual_qty,
-      i.actual_weight,
-      i.damage_broken,
-      i.damage_dirty,
-      i.damage_wet,
-      i.shortage_qty,
-      i.extra_qty,
-      i.rotten_qty,
-      i.remarks,
-      i.status
-    FROM inventory_inbound i
-    LEFT JOIN categories c ON c.id = i.category_id
-    WHERE i.tenant_id = ?
-  `;
-  const inboundParams: any[] = [tenantId];
-  if (categoryId) {
-    inboundSql += ' AND i.category_id = ?';
-    inboundParams.push(categoryId);
+  try {
+    let inboundSql = `
+      SELECT
+        i.id AS inbound_id,
+        i.tenant_id,
+        i.category_id,
+        COALESCE(c.name, '未分类') AS category_name,
+        i.inbound_date,
+        i.vehicle_id,
+        i.batch_no,
+        i.actual_qty,
+        i.actual_weight,
+        i.damage_broken,
+        i.damage_dirty,
+        i.damage_wet,
+        i.shortage_qty,
+        i.extra_qty,
+        i.rotten_qty,
+        i.remarks,
+        i.status
+      FROM inventory_inbound i
+      LEFT JOIN categories c ON c.id = i.category_id
+      WHERE i.tenant_id = ?
+    `;
+    const inboundParams: any[] = [tenantId];
+    if (categoryId) {
+      inboundSql += ' AND i.category_id = ?';
+      inboundParams.push(categoryId);
+    }
+    inboundSql += ' ORDER BY i.inbound_date DESC, i.id DESC';
+
+    const inboundRows = (await db.prepare(inboundSql).bind(...inboundParams).all()).results || [];
+    if (!inboundRows.length) {
+      return c.json({ data: [], meta: { tenant_id: tenantId, degraded: false }, warnings, trace_id: traceId });
+    }
+
+    const outboundCols = await getTableColumns(db, 'inventory_outbound');
+    const hasInboundId = outboundCols.has('inbound_id');
+
+    let outbounds: any[] = [];
+    if (!hasInboundId) {
+      warnings.push({ code: 'OUTBOUND_INBOUND_ID_MISSING', message: 'inventory_outbound 缺少 inbound_id，已降级不关联出库' });
+    } else {
+      const inboundIds = inboundRows.map((r: any) => Number(r.inbound_id));
+      const placeholders = inboundIds.map(() => '?').join(', ');
+      outbounds = (await db.prepare(
+        `SELECT id AS outbound_id, inbound_id, outbound_date, outbound_qty, outbound_weight, remarks, created_by
+         FROM inventory_outbound
+         WHERE inbound_id IN (${placeholders})
+         ORDER BY outbound_date DESC, id DESC`
+      ).bind(...inboundIds).all()).results || [];
+
+      const dirty1 = await db.prepare('SELECT COUNT(*) AS c FROM inventory_outbound WHERE inbound_id IS NULL').first<any>();
+      const dirty2 = await db.prepare('SELECT COUNT(*) AS c FROM inventory_outbound o LEFT JOIN inventory_inbound i ON i.id = o.inbound_id WHERE o.inbound_id IS NOT NULL AND i.id IS NULL').first<any>();
+      const dirty3 = await db.prepare('SELECT COUNT(*) AS c FROM inventory_outbound o JOIN inventory_inbound i ON i.id = o.inbound_id WHERE o.tenant_id != i.tenant_id').first<any>();
+      if (Number(dirty1?.c || 0) > 0) warnings.push({ code: 'OUTBOUND_INBOUND_ID_NULL', message: '存在出库记录缺少 inbound_id', count: Number(dirty1?.c || 0) });
+      if (Number(dirty2?.c || 0) > 0) warnings.push({ code: 'OUTBOUND_ORPHAN_REF', message: '存在出库记录关联不存在的入库', count: Number(dirty2?.c || 0) });
+      if (Number(dirty3?.c || 0) > 0) warnings.push({ code: 'OUTBOUND_CROSS_TENANT', message: '存在跨租户关联的出库记录', count: Number(dirty3?.c || 0) });
+    }
+
+    const outMap = new Map<number, any[]>();
+    for (const o of outbounds as any[]) {
+      const key = Number(o.inbound_id);
+      if (!outMap.has(key)) outMap.set(key, []);
+      outMap.get(key)!.push(o);
+    }
+
+    const data = (inboundRows as any[]).map((inb) => {
+      const list = outMap.get(Number(inb.inbound_id)) || [];
+      const totalQty = list.reduce((s, x) => s + Number(x.outbound_qty || 0), 0);
+      const totalWeight = list.reduce((s, x) => s + Number(x.outbound_weight || 0), 0);
+      const sortedAsc = [...list].sort((a, b) => String(a.outbound_date || '').localeCompare(String(b.outbound_date || '')));
+      const firstOutboundDate = sortedAsc.length ? sortedAsc[0].outbound_date : null;
+      const lastOutboundDate = sortedAsc.length ? sortedAsc[sortedAsc.length - 1].outbound_date : null;
+
+      return {
+        inbound: {
+          inbound_id: inb.inbound_id,
+          tenant_id: inb.tenant_id,
+          category_id: inb.category_id,
+          category_name: inb.category_name,
+          inbound_date: inb.inbound_date,
+          vehicle_id: inb.vehicle_id,
+          batch_no: inb.batch_no,
+          actual_qty: Number(inb.actual_qty || 0),
+          actual_weight: Number(inb.actual_weight || 0),
+          damage_broken: Number(inb.damage_broken || 0),
+          damage_dirty: Number(inb.damage_dirty || 0),
+          damage_wet: Number(inb.damage_wet || 0),
+          shortage_qty: Number(inb.shortage_qty || 0),
+          extra_qty: Number(inb.extra_qty || 0),
+          rotten_qty: Number(inb.rotten_qty || 0),
+          remarks: inb.remarks,
+          status: inb.status,
+        },
+        outbounds: list.map((o) => ({
+          outbound_id: o.outbound_id,
+          outbound_date: o.outbound_date,
+          outbound_qty: Number(o.outbound_qty || 0),
+          outbound_weight: Number(o.outbound_weight || 0),
+          remarks: o.remarks,
+          created_by: o.created_by,
+        })),
+        outbound_summary: {
+          total_count: list.length,
+          total_qty: totalQty,
+          total_weight: totalWeight,
+          first_outbound_date: firstOutboundDate,
+          last_outbound_date: lastOutboundDate,
+        },
+        remaining: {
+          qty: Number(inb.actual_qty || 0) - totalQty,
+          weight: Number(inb.actual_weight || 0) - totalWeight,
+        },
+      };
+    });
+
+    logTrace('info', traceId, '/api/v2/ledger/inbound-outbound', {
+      tenantIdRaw, categoryIdRaw, tenantId, categoryId,
+      inbound_count: inboundRows.length,
+      outbound_count: (outbounds || []).length,
+      degraded: warnings.length > 0,
+      warnings_count: warnings.length,
+    });
+
+    return c.json({ data, meta: { tenant_id: tenantId, degraded: warnings.length > 0 }, warnings, trace_id: traceId });
+  } catch (error: any) {
+    logTrace('error', traceId, '/api/v2/ledger/inbound-outbound', {
+      tenantIdRaw, categoryIdRaw, tenantId, categoryId,
+      error: String(error?.message || error),
+    });
+    return c.json({ data: [], meta: { tenant_id: tenantId, degraded: true }, warnings: [{ code: 'LEDGER_QUERY_FAILED', message: '台账查询失败，已降级返回空结果' }], trace_id: traceId }, 200);
   }
-  inboundSql += ' ORDER BY i.inbound_date DESC, i.id DESC';
-
-  const inboundRows = (await db.prepare(inboundSql).bind(...inboundParams).all()).results || [];
-  if (!inboundRows.length) {
-    return c.json({ data: [] });
-  }
-
-  const inboundIds = inboundRows.map((r: any) => Number(r.inbound_id));
-  const placeholders = inboundIds.map(() => '?').join(', ');
-  const outbounds = (await db.prepare(
-    `SELECT id AS outbound_id, inbound_id, outbound_date, outbound_qty, outbound_weight, remarks, created_by
-     FROM inventory_outbound
-     WHERE inbound_id IN (${placeholders})
-     ORDER BY outbound_date DESC, id DESC`
-  ).bind(...inboundIds).all()).results || [];
-
-  const outMap = new Map<number, any[]>();
-  for (const o of outbounds as any[]) {
-    const key = Number(o.inbound_id);
-    if (!outMap.has(key)) outMap.set(key, []);
-    outMap.get(key)!.push(o);
-  }
-
-  const data = (inboundRows as any[]).map((inb) => {
-    const list = outMap.get(Number(inb.inbound_id)) || [];
-    const totalQty = list.reduce((s, x) => s + Number(x.outbound_qty || 0), 0);
-    const totalWeight = list.reduce((s, x) => s + Number(x.outbound_weight || 0), 0);
-
-    const sortedAsc = [...list].sort((a, b) => String(a.outbound_date || '').localeCompare(String(b.outbound_date || '')));
-    const firstOutboundDate = sortedAsc.length ? sortedAsc[0].outbound_date : null;
-    const lastOutboundDate = sortedAsc.length ? sortedAsc[sortedAsc.length - 1].outbound_date : null;
-
-    return {
-      inbound: {
-        inbound_id: inb.inbound_id,
-        tenant_id: inb.tenant_id,
-        category_id: inb.category_id,
-        category_name: inb.category_name,
-        inbound_date: inb.inbound_date,
-        vehicle_id: inb.vehicle_id,
-        batch_no: inb.batch_no,
-        actual_qty: Number(inb.actual_qty || 0),
-        actual_weight: Number(inb.actual_weight || 0),
-        damage_broken: Number(inb.damage_broken || 0),
-        damage_dirty: Number(inb.damage_dirty || 0),
-        damage_wet: Number(inb.damage_wet || 0),
-        shortage_qty: Number(inb.shortage_qty || 0),
-        extra_qty: Number(inb.extra_qty || 0),
-        rotten_qty: Number(inb.rotten_qty || 0),
-        remarks: inb.remarks,
-        status: inb.status,
-      },
-      outbounds: list.map((o) => ({
-        outbound_id: o.outbound_id,
-        outbound_date: o.outbound_date,
-        outbound_qty: Number(o.outbound_qty || 0),
-        outbound_weight: Number(o.outbound_weight || 0),
-        remarks: o.remarks,
-        created_by: o.created_by,
-      })),
-      outbound_summary: {
-        total_count: list.length,
-        total_qty: totalQty,
-        total_weight: totalWeight,
-        first_outbound_date: firstOutboundDate,
-        last_outbound_date: lastOutboundDate,
-      },
-      remaining: {
-        qty: Number(inb.actual_qty || 0) - totalQty,
-        weight: Number(inb.actual_weight || 0) - totalWeight,
-      },
-    };
-  });
-
-  return c.json({ data });
 });
 
 app.get('/api/v2/history', async (c) => {
@@ -1152,7 +1279,7 @@ app.get('/api/v2/history', async (c) => {
 app.get('/api/health', (c) => c.json({ status: 'ok' }));
 
 // 前端页面 - 根路径返回 HTML
-app.get('/', (c) => {
+app.get("/", (c) => {
   return c.html(`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1243,6 +1370,9 @@ app.get('/', (c) => {
       };
     }
     
+    let currentCompanyId = null;
+    let currentCompanyName = '';
+
     function showMain() {
       document.getElementById('app').innerHTML = \`
         <div class="container">
@@ -1254,68 +1384,157 @@ app.get('/', (c) => {
           </div>
           <div class="stats">
             <div class="stat-card"><div class="stat-value" id="totalCount">-</div><div class="stat-label">总记录数</div></div>
-            <div class="stat-card"><div class="stat-value" id="pendingCount" style="color: #fa8c16;">-</div><div class="stat-label">待复核</div></div>
-            <div class="stat-card"><div class="stat-value" id="approvedCount" style="color: #52c41a;">-</div><div class="stat-label">已确认</div></div>
+            <div class="stat-card"><div class="stat-value" id="pendingCount" style="color: #fa8c16;">-</div><div class="stat-label">待审核</div></div>
+            <div class="stat-card"><div class="stat-value" id="approvedCount" style="color: #52c41a;">-</div><div class="stat-label">已通过</div></div>
             <div class="stat-card"><div class="stat-value" id="totalWeight">-</div><div class="stat-label">总重量(吨)</div></div>
           </div>
-          <div class="toolbar">
-            <span style="color:#666">台账视图（按 Excel：入库 → 出库 → 结余）</span>
-            <button class="btn" onclick="reloadV2Data()">🔄 刷新台账</button>
+
+          <div id="companyListView">
+            <div class="toolbar">
+              <strong>公司列表</strong>
+              <input type="text" id="companySearch" placeholder="输入公司名称搜索" style="min-width:220px;" oninput="renderCompanyList()">
+              <button class="btn" onclick="loadCompanyList()">刷新公司列表</button>
+            </div>
+            <div class="table-container" style="margin-bottom:16px;">
+              <table>
+                <thead>
+                  <tr><th>公司名称</th><th>当前库存（件/吨）</th><th>今日入库（件/吨）</th><th>今日出库（件/吨）</th><th>操作</th></tr>
+                </thead>
+                <tbody id="companyBody"></tbody>
+              </table>
+            </div>
           </div>
 
-          <div class="toolbar">
-            <strong>v2 出库登记（从仍有库存入库中选择）</strong>
-            <input type="number" id="v2TenantId" placeholder="tenant" value="1" style="width:90px;" onchange="reloadV2Data()">
-            <input type="number" id="v2CategoryId" placeholder="category(可选)" style="width:130px;" onchange="reloadV2Data()">
-            <select id="v2InboundSelect" style="min-width:340px;"></select>
-            <input type="date" id="v2OutboundDate" style="width:150px;">
-            <input type="number" id="v2OutboundQty" placeholder="出库件数" style="width:110px;">
-            <input type="number" id="v2OutboundWeight" placeholder="出库吨数" style="width:110px;">
-            <button class="btn" id="v2SubmitBtn" onclick="createOutboundV2()">提交出库</button>
-          </div>
-          <div class="toolbar" id="v2InboundHint" style="color:#666; font-size:13px;">加载中...</div>
-          <div class="toolbar" id="v2LimitHint" style="color:#999; font-size:13px;">请选择入库记录后录入出库数量</div>
+          <div id="companyDetailView" style="display:none;">
+            <div class="toolbar">
+              <button class="btn" onclick="backToCompanyList()">返回公司列表</button>
+              <strong id="companyTitle">公司详情</strong>
+              <input type="hidden" id="v2TenantId" value="1">
+              <select id="v2CategoryId" style="min-width:170px;" onchange="reloadV2Data()"><option value="">全部货类</option></select>
+              <input type="date" id="filterStartDate" onchange="reloadV2Data()">
+              <input type="date" id="filterEndDate" onchange="reloadV2Data()">
+              <button class="btn" onclick="reloadV2Data()">刷新详情</button>
+            </div>
 
-          <div class="table-container" style="margin-bottom:16px;">
-            <table>
-              <thead><tr><th colspan="7">v2 待审批入库（Agent）</th></tr></thead>
-              <thead>
-                <tr><th>ID</th><th>tenant</th><th>category</th><th>batch</th><th>件数</th><th>状态</th><th>操作</th></tr>
-              </thead>
-              <tbody id="pendingBody"></tbody>
-            </table>
-          </div>
+            <div class="toolbar">
+              <strong>出库登记（从仍有库存入库中选择）</strong>
+              <select id="v2InboundSelect" style="min-width:340px;"></select>
+              <input type="date" id="v2OutboundDate" style="width:150px;">
+              <input type="number" id="v2OutboundQty" placeholder="出库件数" style="width:110px;">
+              <input type="number" id="v2OutboundWeight" placeholder="出库吨数" style="width:110px;">
+              <button class="btn" id="v2SubmitBtn" onclick="createOutboundV2()">提交出库</button>
+            </div>
+            <div class="toolbar" id="v2InboundHint" style="color:#666; font-size:13px;">加载中...</div>
+            <div class="toolbar" id="v2LimitHint" style="color:#999; font-size:13px;">请选择入库记录后录入出库数量</div>
 
-          <div class="table-container">
-            <table>
-              <thead>
-                <tr><th>操作</th><th>入库ID</th><th>入库日期</th><th>车号</th><th>批号</th><th>实收件数</th><th>实收吨数</th><th>出库汇总</th><th>库存件数</th><th>库存吨数</th></tr>
-              </thead>
-              <tbody id="ledgerBody"></tbody>
-            </table>
+            <div class="table-container" style="margin-bottom:16px;">
+              <table>
+                <thead><tr><th colspan="7">待审批入库（采集端）</th></tr></thead>
+                <thead><tr><th>ID</th><th>租户</th><th>货类</th><th>批号</th><th>件数</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="pendingBody"></tbody>
+              </table>
+            </div>
+
+            <div class="table-container" style="margin-bottom:16px;">
+              <table>
+                <thead><tr><th>操作</th><th>入库ID</th><th>入库日期</th><th>车号</th><th>批号</th><th>实收件数</th><th>实收吨数</th><th>出库汇总</th><th>库存件数</th><th>库存吨数</th></tr></thead>
+                <tbody id="ledgerBody"></tbody>
+              </table>
+            </div>
+
+            <div class="table-container" style="margin-bottom:16px;">
+              <table>
+                <thead><tr><th colspan="6">出库明细</th></tr></thead>
+                <thead><tr><th>出库ID</th><th>入库ID</th><th>出库日期</th><th>件数</th><th>吨数</th><th>备注</th></tr></thead>
+                <tbody id="outboundBody"></tbody>
+              </table>
+            </div>
+
+            <div class="table-container">
+              <table>
+                <thead><tr><th colspan="5">当前库存（按货类/批号）</th></tr></thead>
+                <thead><tr><th>货类</th><th>批号</th><th>库存件数</th><th>库存吨数</th><th>更新时间</th></tr></thead>
+                <tbody id="stockBody"></tbody>
+              </table>
+            </div>
           </div>
         </div>
       \`;
       document.getElementById('v2OutboundQty')?.addEventListener('input', updateLimitHint);
       document.getElementById('v2OutboundWeight')?.addEventListener('input', updateLimitHint);
       loadStats();
-      reloadV2Data();
-      loadPendingV2();
+      loadCompanyList();
     }
-    
+
     async function loadStats() {
-      const res = await fetch(\`\${API_BASE}/admin/stats\`, {
-        headers: { 'Authorization': \`Bearer \${token}\` }
-      });
+      const res = await fetch(\`\${API_BASE}/admin/stats\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
       const data = await res.json();
       document.getElementById('totalCount').textContent = data.total_records || 0;
       document.getElementById('pendingCount').textContent = data.pending_count || 0;
       document.getElementById('approvedCount').textContent = data.approved_count || 0;
       document.getElementById('totalWeight').textContent = (data.total_weight || 0).toFixed(2);
     }
-    
+
+    let companyList = [];
+    async function loadCompanyList() {
+      const res = await fetch(\`\${API_BASE}/v2/companies/overview\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
+      const payload = await res.json();
+      companyList = payload.data || [];
+      renderCompanyList();
+    }
+
+    function renderCompanyList() {
+      const keyword = String(document.getElementById('companySearch')?.value || '').trim().toLowerCase();
+      const tbody = document.getElementById('companyBody');
+      if (!tbody) return;
+      const list = keyword ? companyList.filter(x => String(x.name || '').toLowerCase().includes(keyword)) : companyList;
+      if (!list.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">暂无公司数据</td></tr>';
+        return;
+      }
+      tbody.innerHTML = list.map(row => \`
+        <tr>
+          <td>\${row.name || '-'}（ID: \${row.id}）</td>
+          <td>\${row.stock_qty || 0} 件 / \${row.stock_weight || 0} 吨</td>
+          <td>\${row.today_in_qty || 0} 件 / \${row.today_in_weight || 0} 吨</td>
+          <td>\${row.today_out_qty || 0} 件 / \${row.today_out_weight || 0} 吨</td>
+          <td><button class="btn" style="padding:4px 10px;font-size:12px;" onclick="openCompanyDetail(\${row.id}, '\${String(row.name || '').replace(/'/g, "\'")}')">进入</button></td>
+        </tr>
+      \`).join('');
+    }
+
+    async function openCompanyDetail(companyId, companyName) {
+      currentCompanyId = Number(companyId);
+      currentCompanyName = String(companyName || \`公司#\${companyId}\`);
+      document.getElementById('v2TenantId').value = String(companyId);
+      document.getElementById('companyTitle').textContent = \`公司详情：\${currentCompanyName}\`;
+      document.getElementById('companyListView').style.display = 'none';
+      document.getElementById('companyDetailView').style.display = '';
+      await loadCategoryOptions(companyId);
+      await reloadV2Data();
+      await loadPendingV2();
+    }
+
+    function backToCompanyList() {
+      currentCompanyId = null;
+      currentCompanyName = '';
+      document.getElementById('companyDetailView').style.display = 'none';
+      document.getElementById('companyListView').style.display = '';
+      loadCompanyList();
+    }
+
+    async function loadCategoryOptions(tenantId) {
+      const select = document.getElementById('v2CategoryId');
+      if (!select) return;
+      const res = await fetch(\`\${API_BASE}/v2/categories?tenantId=\${tenantId}\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
+      const payload = await res.json();
+      const data = payload.data || [];
+      select.innerHTML = \`<option value="">全部货类</option>\` + data.map(x => \`<option value="\${x.id}">\${x.name || x.code || ('货类' + x.id)}</option>\`).join('');
+    }
+
     async function reloadV2Data() {
-      await Promise.all([loadAvailableInboundV2(), loadLedgerV2()]);
+      if (!currentCompanyId) return;
+      await Promise.all([loadAvailableInboundV2(), loadLedgerV2(), loadOutboundListV2(), loadStockSummaryV2()]);
     }
 
     async function loadAvailableInboundV2() {
@@ -1323,18 +1542,13 @@ app.get('/', (c) => {
       const categoryId = document.getElementById('v2CategoryId')?.value || '';
       const params = new URLSearchParams({ tenantId });
       if (categoryId) params.set('categoryId', categoryId);
-
-      const res = await fetch(\`\${API_BASE}/v2/inbound/available?\${params.toString()}\`, {
-        headers: { 'Authorization': \`Bearer \${token}\` }
-      });
+      const res = await fetch(\`\${API_BASE}/v2/inbound/available?\${params.toString()}\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
       const payload = await res.json();
       const data = payload.data || [];
-
       const select = document.getElementById('v2InboundSelect');
       const hint = document.getElementById('v2InboundHint');
       const btn = document.getElementById('v2SubmitBtn');
       if (!select || !hint || !btn) return;
-
       if (!data.length) {
         select.innerHTML = '<option value="">暂无可出库库存</option>';
         hint.textContent = '当前无可出库库存，请先完成入库或审批。';
@@ -1343,12 +1557,10 @@ app.get('/', (c) => {
         btn.disabled = true;
         return;
       }
-
       select.innerHTML = data.map(row => {
         const label = \`#\${row.inbound_id} \${row.batch_no || '-'} | 剩余 \${row.remaining_qty || 0}件/\${row.remaining_weight || 0}吨\`;
         return \`<option value="\${row.inbound_id}" data-qty="\${row.remaining_qty || 0}" data-weight="\${row.remaining_weight || 0}">\${label}</option>\`;
       }).join('');
-
       const first = data[0];
       hint.textContent = \`已加载 \${data.length} 条可出库入库记录，当前选择 #\${first.inbound_id}，剩余 \${first.remaining_qty || 0} 件 / \${first.remaining_weight || 0} 吨。\`;
       btn.disabled = false;
@@ -1390,80 +1602,91 @@ app.get('/', (c) => {
       const categoryId = document.getElementById('v2CategoryId')?.value || '';
       const params = new URLSearchParams({ tenantId });
       if (categoryId) params.set('categoryId', categoryId);
-
-      const res = await fetch(\`\${API_BASE}/v2/ledger/inbound-outbound?\${params.toString()}\`, {
-        headers: { 'Authorization': \`Bearer \${token}\` }
-      });
+      const res = await fetch(\`\${API_BASE}/v2/ledger/inbound-outbound?\${params.toString()}\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
       const payload = await res.json();
       const data = payload.data || [];
       const tbody = document.getElementById('ledgerBody');
       if (!tbody) return;
-
       if (!data.length) {
         tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#999;">暂无入库数据</td></tr>';
         return;
       }
-
       tbody.innerHTML = data.map(item => {
         const inbound = item.inbound || {};
         const outbounds = item.outbounds || [];
         const summary = item.outbound_summary || {};
         const remaining = item.remaining || {};
         const hasOutbound = outbounds.length > 0;
-        const summaryText = hasOutbound
-          ? \`\${summary.total_count || 0}笔 / \${summary.total_qty || 0}件 / \${summary.total_weight || 0}吨\`
-          : '<span class="status-badge">未出库</span>';
-
-        const detailHtml = hasOutbound
-          ? \`
+        const summaryText = hasOutbound ? \`\${summary.total_count || 0}笔 / \${summary.total_qty || 0}件 / \${summary.total_weight || 0}吨\` : '<span class="status-badge">未出库</span>';
+        const detailHtml = hasOutbound ? \`
             <table style="width:100%; border-collapse:collapse; margin-top:8px; font-size:12px;">
-              <thead>
-                <tr style="background:#fafafa;"><th style="padding:8px;">出库ID</th><th style="padding:8px;">出库日期</th><th style="padding:8px;">件数</th><th style="padding:8px;">吨数</th><th style="padding:8px;">备注</th><th style="padding:8px;">操作人</th></tr>
-              </thead>
+              <thead><tr style="background:#fafafa;"><th style="padding:8px;">出库ID</th><th style="padding:8px;">出库日期</th><th style="padding:8px;">件数</th><th style="padding:8px;">吨数</th><th style="padding:8px;">备注</th><th style="padding:8px;">操作人</th></tr></thead>
               <tbody>
-                \${outbounds.map(o => \`
-                  <tr>
-                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_id}</td>
-                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_date || '-'}</td>
-                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_qty || 0}</td>
-                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_weight || 0}</td>
-                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.remarks || '-'}</td>
-                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.created_by || '-'}</td>
-                  </tr>
-                \`).join('')}
+                \${outbounds.map(o => \`<tr><td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_id}</td><td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_date || '-'}</td><td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_qty || 0}</td><td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_weight || 0}</td><td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.remarks || '-'}</td><td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.created_by || '-'}</td></tr>\`).join('')}
               </tbody>
             </table>
-          \`
-          : \`
-            <div style="margin:8px 0; padding:12px; border:1px dashed #d9d9d9; border-radius:8px; background:#fcfcfc; color:#666;">
-              <div style="font-weight:600; margin-bottom:6px;">该入库记录暂未关联出库记录</div>
-              <div style="font-size:12px; color:#999;">可在上方“出库登记”中选择本入库发起出库</div>
-            </div>
-          \`;
-
+          \` : \`<div style="margin:8px 0; padding:12px; border:1px dashed #d9d9d9; border-radius:8px; background:#fcfcfc; color:#666;"><div style="font-weight:600; margin-bottom:6px;">该入库记录暂未关联出库记录</div><div style="font-size:12px; color:#999;">可在上方“出库登记”中选择本入库发起出库</div></div>\`;
         return \`
           <tr id="inbound-row-\${inbound.inbound_id}">
             <td><button class="btn" style="padding:4px 8px;font-size:12px;" onclick="toggleOutboundDetails(\${inbound.inbound_id})">展开</button></td>
-            <td>\${inbound.inbound_id}</td>
-            <td>\${inbound.inbound_date || '-'}</td>
-            <td>\${inbound.vehicle_id || '-'}</td>
-            <td><span class="tag">\${inbound.batch_no || '-'}</span></td>
-            <td>\${inbound.actual_qty || 0}</td>
-            <td>\${inbound.actual_weight || 0}</td>
-            <td>\${summaryText}</td>
-            <td>\${remaining.qty || 0}</td>
-            <td>\${remaining.weight || 0}</td>
+            <td>\${inbound.inbound_id}</td><td>\${inbound.inbound_date || '-'}</td><td>\${inbound.vehicle_id || '-'}</td><td><span class="tag">\${inbound.batch_no || '-'}</span></td><td>\${inbound.actual_qty || 0}</td><td>\${inbound.actual_weight || 0}</td><td>\${summaryText}</td><td>\${remaining.qty || 0}</td><td>\${remaining.weight || 0}</td>
           </tr>
-          <tr id="detail-row-\${inbound.inbound_id}" style="display:none; background:#fff;">
-            <td colspan="10" style="padding:8px 12px;">\${detailHtml}</td>
-          </tr>
+          <tr id="detail-row-\${inbound.inbound_id}" style="display:none; background:#fff;"><td colspan="10" style="padding:8px 12px;">\${detailHtml}</td></tr>
         \`;
       }).join('');
-
       if (lastUpdatedInboundId) {
         focusInboundRow(lastUpdatedInboundId);
         lastUpdatedInboundId = null;
       }
+    }
+
+    async function loadOutboundListV2() {
+      const tenantId = document.getElementById('v2TenantId')?.value || '1';
+      const res = await fetch(\`\${API_BASE}/v2/outbound?tenantId=\${tenantId}&page=1&limit=100\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
+      const payload = await res.json();
+      const data = payload.data || [];
+      const tbody = document.getElementById('outboundBody');
+      if (!tbody) return;
+      if (!data.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#999;">暂无出库数据</td></tr>';
+        return;
+      }
+      tbody.innerHTML = data.map(row => \`<tr><td>\${row.id}</td><td>\${row.inbound_id || '-'}</td><td>\${row.outbound_date || '-'}</td><td>\${row.outbound_qty || 0}</td><td>\${row.outbound_weight || 0}</td><td>\${row.remarks || '-'}</td></tr>\`).join('');
+    }
+
+    async function loadStockSummaryV2() {
+      const tenantId = document.getElementById('v2TenantId')?.value || '1';
+      const categoryId = document.getElementById('v2CategoryId')?.value || '';
+      const params = new URLSearchParams({ tenantId });
+      if (categoryId) params.set('categoryId', categoryId);
+      const res = await fetch(\`\${API_BASE}/v2/stock/summary?\${params.toString()}\`, { headers: { 'Authorization': \`Bearer \${token}\` } });
+      const payload = await res.json();
+      const data = payload.data || [];
+      const tbody = document.getElementById('stockBody');
+      if (!tbody) return;
+      if (!data.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999;">暂无库存数据</td></tr>';
+        return;
+      }
+      tbody.innerHTML = data.map(row => \`<tr><td>\${row.category_name || ('货类#' + row.category_id)}</td><td>\${row.batch_no || '-'}</td><td>\${row.available_qty || 0}</td><td>\${row.available_weight || 0}</td><td>\${row.updated_at || '-'}</td></tr>\`).join('');
+    }
+
+    function mapStatusText(status) {
+      const map = {
+        pending_review: '待审核',
+        approved: '已通过',
+        rejected: '已驳回'
+      };
+      return map[status] || '未知状态';
+    }
+
+    function mapErrorText(errorText) {
+      const text = String(errorText || '');
+      if (!text) return '提交失败，请稍后重试';
+      if (text.includes('Outbound exceeds available inventory')) return '出库数量超出可用库存';
+      if (text.includes('inbound_id and outbound_qty are required')) return '缺少必要参数：入库ID或出库件数';
+      if (text.includes('Inbound record not found')) return '未找到可用的入库记录';
+      return '提交失败，请稍后重试';
     }
 
     async function loadPendingV2() {
@@ -1482,7 +1705,7 @@ app.get('/', (c) => {
           <td>\${row.category_id}</td>
           <td>\${row.batch_no || '-'}</td>
           <td>\${row.actual_qty || 0}</td>
-          <td>\${row.status}</td>
+          <td>\${mapStatusText(row.status)}</td>
           <td>
             <button class="btn" style="padding:4px 8px;font-size:12px;" onclick="viewAttachmentsV2(\${row.id}, \${row.tenant_id})">附件</button>
             <button class="btn btn-success" style="padding:4px 8px;font-size:12px;" onclick="approveV2(\${row.id})">通过</button>
@@ -1560,7 +1783,7 @@ app.get('/', (c) => {
       });
       const data = await res.json();
       if (!res.ok) {
-        alert(data.error || '提交失败');
+        alert(mapErrorText(data.error));
         return;
       }
       alert(\`出库登记成功（出库ID: \${data.id}），剩余 \${data.remaining_qty} 件 / \${data.remaining_weight} 吨\`);
@@ -1580,4 +1803,5 @@ app.get('/', (c) => {
 </html>`);
 });
 
+// app.get('/')
 export default app;

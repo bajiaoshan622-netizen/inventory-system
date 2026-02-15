@@ -69,6 +69,14 @@ v2 进入 UI/UX 质量整改阶段，目标是与用户 Excel 台账的认知模
 ### 5.3 Ledger（Excel式台账）
 - `GET /api/v2/ledger/inbound-outbound?tenantId=&categoryId=`
 
+### 5.4 多公司视图支撑接口（M4）
+- `GET /api/v2/companies/overview`
+  - 用途：公司列表页聚合卡片数据（当前库存、今日入库、今日出库）
+  - 返回字段：`id/name/stock_qty/stock_weight/today_in_qty/today_in_weight/today_out_qty/today_out_weight`
+- `GET /api/v2/stock/summary?tenantId=&categoryId=`
+  - 用途：公司详情页“当前库存”分区展示（按货类/批号）
+  - 返回字段：`tenant_id/category_id/category_name/batch_no/available_qty/available_weight/updated_at`
+
 返回结构示例（必须遵循）：
 ```json
 {
@@ -168,10 +176,73 @@ v2 进入 UI/UX 质量整改阶段，目标是与用户 Excel 台账的认知模
 - [ ] 超量出库返回 409
 - [ ] UI 可直接消费 outbounds[] 渲染主行展开明细
 
-## 8. Change Log
+## 8. 容错与降级策略（新增）
+
+### 8.1 目标接口
+- `GET /api/v2/ledger/inbound-outbound?tenantId=&categoryId=`
+- `GET /api/v2/inbound/available?tenantId=&categoryId=`
+
+### 8.2 数据异常分类
+- 无数据：指定 tenant/category 下不存在记录
+- 脏关联：`inventory_outbound.inbound_id` 缺失、指向不存在入库、或跨 tenant 关联
+- 缺字段：`category` 缺失、备注为空、日期为空
+- 数值异常：件数/吨数为 `NULL`、非数值、负数
+
+### 8.3 /ledger 容错规则
+1. 无数据返回 `200`：`{ data: [], meta, warnings: [] }`
+2. 以 inbound 为主表输出，脏 outbound 不阻断主流程；异常记录计入 `warnings`
+3. 数值统一安全转换：`safeNumber(x, 0)`，避免 `NaN` 污染
+4. 缺分类时回退：`category_name = "未分类"`
+5. `remaining` 小于 0 时按 0 返回并写入 `warnings`（避免前端崩溃）
+
+### 8.4 /inbound/available 容错规则
+1. 无可出库记录返回 `200`：`{ data: [], meta, warnings: [] }`
+2. 仅返回 `remaining_qty > 0 或 remaining_weight > 0` 的入库
+3. 发现脏出库导致负库存时，当前入库不入结果集，并写入 `warnings`
+4. 缺分类字段不阻断，按默认值返回
+
+### 8.5 错误码策略（修订）
+- `400`：参数错误（如 tenantId 非法）
+- `401`：认证失败
+- `403`：权限不足
+- `404`：指定资源不存在（按 ID 查询场景）
+- `409`：库存冲突（超量出库/状态冲突）
+- `500`：系统异常（仅不可预期错误），必须返回 `trace_id`
+
+### 8.6 降级响应示例
+```json
+{
+  "data": [],
+  "meta": {
+    "tenant_id": 1,
+    "total": 0,
+    "degraded": true
+  },
+  "warnings": [
+    { "code": "ORPHAN_OUTBOUND_IGNORED", "count": 12 },
+    { "code": "CATEGORY_MISSING_FALLBACK", "count": 3 }
+  ]
+}
+```
+
+
+### 8.7 统一降级响应约定（M2执行补充）
+- `/api/v2/ledger/inbound-outbound` 与 `/api/v2/inbound/available` 返回体统一包含：
+  - `data`: 业务数据（可为空数组）
+  - `meta.degraded`: 是否触发降级（`true/false`）
+  - `warnings`: 降级/脏数据告警数组
+  - `trace_id`: 请求追踪ID
+- 当检测到历史 schema 缺列（如 `inventory_outbound.inbound_id`）时：
+  - 必须返回 `200`
+  - 不抛 500
+  - `meta.degraded = true`
+  - `warnings` 至少包含 `OUTBOUND_INBOUND_ID_MISSING`
+
+## 9. Change Log
 | 日期 | 变更 | 作者 |
 |---|---|---|
 | 2026-02-15 | 实现收口：ledger 接口输出嵌套结构并供 UI 展开消费 | 光年 |
+| 2026-02-15 | M2落地：/ledger 与 /inbound/available 增加缺列探测与降级返回（meta.degraded + warnings + trace_id） | 光年 |
 | 2026-02-15 | 增加 ledger JSON 结构示例（inbound/outbounds/summary/remaining） | 光年 |
 | 2026-02-15 | 补充 inbound-outbound 关联与台账视图规则；明确可出库池与校验 | 光年 |
 | 2026-02-15 | v2 API 设计初稿 | 光年 |
