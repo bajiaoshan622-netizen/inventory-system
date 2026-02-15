@@ -1102,6 +1102,28 @@ app.get('/', (c) => {
             </select>
             <button class="btn" onclick="loadData()">🔍 查询</button>
           </div>
+
+          <div class="toolbar">
+            <strong>v2 出库登记</strong>
+            <input type="number" id="v2TenantId" placeholder="tenant" value="1" style="width:90px;">
+            <input type="number" id="v2CategoryId" placeholder="category" style="width:100px;">
+            <input type="text" id="v2BatchNo" placeholder="batch_no">
+            <input type="number" id="v2OutboundQty" placeholder="出库件数" style="width:110px;">
+            <input type="number" id="v2OutboundWeight" placeholder="出库吨数" style="width:110px;">
+            <button class="btn" onclick="createOutboundV2()">提交出库</button>
+            <button class="btn" onclick="loadPendingV2()">刷新待审批</button>
+          </div>
+
+          <div class="table-container" style="margin-bottom:16px;">
+            <table>
+              <thead><tr><th colspan="7">v2 待审批入库（Agent）</th></tr></thead>
+              <thead>
+                <tr><th>ID</th><th>tenant</th><th>category</th><th>batch</th><th>件数</th><th>状态</th><th>操作</th></tr>
+              </thead>
+              <tbody id="pendingBody"></tbody>
+            </table>
+          </div>
+
           <div class="table-container">
             <table>
               <thead>
@@ -1114,6 +1136,7 @@ app.get('/', (c) => {
       \`;
       loadStats();
       loadData();
+      loadPendingV2();
     }
     
     async function loadStats() {
@@ -1177,6 +1200,71 @@ app.get('/', (c) => {
         headers: { 'Authorization': \`Bearer \${token}\` }
       });
       loadData();
+      loadStats();
+    }
+
+    async function loadPendingV2() {
+      const tenantId = document.getElementById('v2TenantId')?.value || '1';
+      const res = await fetch(\`\${API_BASE}/v2/inbound/pending?tenantId=\${tenantId}\`, {
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      const payload = await res.json();
+      const data = payload.data || [];
+      const tbody = document.getElementById('pendingBody');
+      if (!tbody) return;
+      tbody.innerHTML = data.map(row => \`
+        <tr>
+          <td>\${row.id}</td>
+          <td>\${row.tenant_id}</td>
+          <td>\${row.category_id}</td>
+          <td>\${row.batch_no || '-'}</td>
+          <td>\${row.actual_qty || 0}</td>
+          <td>\${row.status}</td>
+          <td>
+            <button class="btn btn-success" style="padding:4px 8px;font-size:12px;" onclick="approveV2(\${row.id})">通过</button>
+            <button class="btn btn-danger" style="padding:4px 8px;font-size:12px;" onclick="rejectV2(\${row.id})">驳回</button>
+          </td>
+        </tr>
+      \`).join('');
+    }
+
+    async function approveV2(id) {
+      await fetch(\`\${API_BASE}/v2/inbound/\${id}/approve\`, {
+        method: 'POST',
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      loadPendingV2();
+    }
+
+    async function rejectV2(id) {
+      await fetch(\`\${API_BASE}/v2/inbound/\${id}/reject\`, {
+        method: 'POST',
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      loadPendingV2();
+    }
+
+    async function createOutboundV2() {
+      const tenant_id = Number(document.getElementById('v2TenantId')?.value || 1);
+      const category_id = Number(document.getElementById('v2CategoryId')?.value || 0);
+      const batch_no = document.getElementById('v2BatchNo')?.value || '';
+      const outbound_qty = Number(document.getElementById('v2OutboundQty')?.value || 0);
+      const outbound_weight = Number(document.getElementById('v2OutboundWeight')?.value || 0);
+
+      const res = await fetch(\`\${API_BASE}/v2/outbound\`, {
+        method: 'POST',
+        headers: {
+          'Authorization': \`Bearer \${token}\`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ tenant_id, category_id, batch_no, outbound_qty, outbound_weight })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || '提交失败');
+        return;
+      }
+      alert(\`出库成功，ID: \${data.id}\`);
       loadStats();
     }
     
