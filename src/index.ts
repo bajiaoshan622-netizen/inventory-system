@@ -1221,11 +1221,26 @@ app.get('/', (c) => {
           <td>\${row.actual_qty || 0}</td>
           <td>\${row.status}</td>
           <td>
+            <button class="btn" style="padding:4px 8px;font-size:12px;" onclick="viewAttachmentsV2(\${row.id}, \${row.tenant_id})">附件</button>
             <button class="btn btn-success" style="padding:4px 8px;font-size:12px;" onclick="approveV2(\${row.id})">通过</button>
             <button class="btn btn-danger" style="padding:4px 8px;font-size:12px;" onclick="rejectV2(\${row.id})">驳回</button>
           </td>
         </tr>
       \`).join('');
+    }
+
+    async function viewAttachmentsV2(id, tenantId) {
+      const res = await fetch(\`\${API_BASE}/v2/attachments?tenantId=\${tenantId}&recordType=inbound&recordId=\${id}\`, {
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      const payload = await res.json();
+      const data = payload.data || [];
+      if (!data.length) {
+        alert('该记录暂无附件');
+        return;
+      }
+      const urls = data.map(a => \`\${API_BASE}/v2/attachments/file/\${a.r2_key}\`);
+      alert(\`附件数量: \${data.length}\n\` + urls.join('\n'));
     }
 
     async function approveV2(id) {
