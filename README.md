@@ -2,6 +2,14 @@
 
 基于 Cloudflare Workers + D1 + R2 的轻量级库存管理系统。
 
+## 文档入口
+
+- 项目文档索引：`docs/README.md`
+- 架构说明：`docs/architecture.md`
+- API 文档：`docs/api.md`
+- 部署文档：`docs/deployment.md`
+- 运维文档：`docs/operations.md`
+
 ## 功能特性
 
 - **双权限设计**：管理员（复核权限）+ Agent（录入权限，无删除）

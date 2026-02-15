@@ -856,7 +856,7 @@ app.post('/api/v2/inbound/:id/reject', async (c) => {
   return c.json({ rejected: true });
 });
 
-// Outbound create (admin only, direct effective)
+// Outbound create (admin only, direct effective; must select one approved inbound with remaining stock)
 app.post('/api/v2/outbound', async (c) => {
   const actor = await requireActor(c, ['admin']);
   if (actor instanceof Response) return actor;
@@ -864,32 +864,43 @@ app.post('/api/v2/outbound', async (c) => {
   const body = await c.req.json();
 
   const tenantId = Number(body.tenant_id || 1);
-  const categoryId = Number(body.category_id);
-  const batchNo = String(body.batch_no || '').trim();
+  const inboundId = Number(body.inbound_id || 0);
   const outboundQty = Number(body.outbound_qty || 0);
   const outboundWeight = Number(body.outbound_weight || 0);
 
-  if (!categoryId || !batchNo || outboundQty <= 0) {
-    return c.json({ error: 'category_id, batch_no, outbound_qty are required' }, 400);
+  if (!inboundId || outboundQty <= 0) {
+    return c.json({ error: 'inbound_id and outbound_qty are required' }, 400);
   }
 
-  const bal = await db.prepare(
-    'SELECT available_qty, available_weight FROM inventory_balance WHERE tenant_id = ? AND category_id = ? AND batch_no = ?'
-  ).bind(tenantId, categoryId, batchNo).first<any>();
-
-  const availableQty = Number(bal?.available_qty || 0);
-  const availableWeight = Number(bal?.available_weight || 0);
-  if (outboundQty > availableQty || outboundWeight > availableWeight) {
-    return c.json({ error: 'Outbound exceeds available inventory' }, 409);
+  const inbound = await db.prepare(
+    'SELECT * FROM inventory_inbound WHERE id = ? AND tenant_id = ? AND status = "approved"'
+  ).bind(inboundId, tenantId).first<any>();
+  if (!inbound) {
+    return c.json({ error: 'Inbound record not found or not approved' }, 404);
   }
+
+  const used = await db.prepare(
+    'SELECT COALESCE(SUM(outbound_qty), 0) AS used_qty, COALESCE(SUM(outbound_weight), 0) AS used_weight FROM inventory_outbound WHERE inbound_id = ?'
+  ).bind(inboundId).first<any>();
+
+  const remainingQty = Number(inbound.actual_qty || 0) - Number(used?.used_qty || 0);
+  const remainingWeight = Number(inbound.actual_weight || 0) - Number(used?.used_weight || 0);
+
+  if (remainingQty <= 0 || outboundQty > remainingQty || outboundWeight > remainingWeight) {
+    return c.json({ error: 'Outbound exceeds available inventory of selected inbound' }, 409);
+  }
+
+  const categoryId = Number(inbound.category_id);
+  const batchNo = String(inbound.batch_no || '');
 
   const r = await db.prepare(`
     INSERT INTO inventory_outbound (
-      tenant_id, category_id, batch_no, outbound_date, outbound_qty, outbound_weight,
+      tenant_id, inbound_id, category_id, batch_no, outbound_date, outbound_qty, outbound_weight,
       remarks, status, source, created_by, approved_by, approved_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', 'admin', ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved', 'admin', ?, ?, ?)
   `).bind(
     tenantId,
+    inboundId,
     categoryId,
     batchNo,
     body.outbound_date || null,
@@ -903,9 +914,9 @@ app.post('/api/v2/outbound', async (c) => {
 
   const id = Number(r.meta.last_row_id || 0);
   await upsertBalance(db, tenantId, categoryId, batchNo, -outboundQty, -outboundWeight);
-  await addHistory(db, tenantId, 'outbound', id, 'create', null, body, actor.id);
+  await addHistory(db, tenantId, 'outbound', id, 'create', null, { ...body, inbound_id: inboundId, category_id: categoryId, batch_no: batchNo }, actor.id);
 
-  return c.json({ id, status: 'approved' }, 201);
+  return c.json({ id, status: 'approved', remaining_qty: remainingQty - outboundQty, remaining_weight: remainingWeight - outboundWeight }, 201);
 });
 
 app.get('/api/v2/inbound', async (c) => {
@@ -936,6 +947,42 @@ app.get('/api/v2/inbound/pending', async (c) => {
   const { results } = await c.env.DB.prepare(
     'SELECT * FROM inventory_inbound WHERE tenant_id = ? AND status = "pending_review" ORDER BY id DESC'
   ).bind(tenantId).all();
+  return c.json({ data: results });
+});
+
+app.get('/api/v2/inbound/available', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const categoryId = Number(c.req.query('categoryId') || 0);
+
+  let sql = `
+    SELECT
+      i.id AS inbound_id,
+      i.tenant_id,
+      i.category_id,
+      c.name AS category_name,
+      i.batch_no,
+      i.inbound_date,
+      i.actual_qty,
+      i.actual_weight,
+      COALESCE(SUM(o.outbound_qty), 0) AS used_qty,
+      COALESCE(SUM(o.outbound_weight), 0) AS used_weight,
+      (i.actual_qty - COALESCE(SUM(o.outbound_qty), 0)) AS remaining_qty,
+      (i.actual_weight - COALESCE(SUM(o.outbound_weight), 0)) AS remaining_weight
+    FROM inventory_inbound i
+    LEFT JOIN inventory_outbound o ON o.inbound_id = i.id
+    LEFT JOIN categories c ON c.id = i.category_id
+    WHERE i.tenant_id = ? AND i.status = 'approved'
+  `;
+  const params: any[] = [tenantId];
+  if (categoryId) {
+    sql += ' AND i.category_id = ?';
+    params.push(categoryId);
+  }
+  sql += ' GROUP BY i.id HAVING remaining_qty > 0 OR remaining_weight > 0 ORDER BY i.inbound_date DESC, i.id DESC';
+
+  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
   return c.json({ data: results });
 });
 
@@ -973,6 +1020,118 @@ app.get('/api/v2/balance', async (c) => {
 
   const { results } = await c.env.DB.prepare(sql).bind(...params).all();
   return c.json({ data: results });
+});
+
+app.get('/api/v2/ledger/inbound-outbound', async (c) => {
+  const actor = await requireActor(c, ['admin', 'agent']);
+  if (actor instanceof Response) return actor;
+  const db = c.env.DB;
+  const tenantId = Number(c.req.query('tenantId') || 1);
+  const categoryId = Number(c.req.query('categoryId') || 0);
+
+  let inboundSql = `
+    SELECT
+      i.id AS inbound_id,
+      i.tenant_id,
+      i.category_id,
+      c.name AS category_name,
+      i.inbound_date,
+      i.vehicle_id,
+      i.batch_no,
+      i.actual_qty,
+      i.actual_weight,
+      i.damage_broken,
+      i.damage_dirty,
+      i.damage_wet,
+      i.shortage_qty,
+      i.extra_qty,
+      i.rotten_qty,
+      i.remarks,
+      i.status
+    FROM inventory_inbound i
+    LEFT JOIN categories c ON c.id = i.category_id
+    WHERE i.tenant_id = ?
+  `;
+  const inboundParams: any[] = [tenantId];
+  if (categoryId) {
+    inboundSql += ' AND i.category_id = ?';
+    inboundParams.push(categoryId);
+  }
+  inboundSql += ' ORDER BY i.inbound_date DESC, i.id DESC';
+
+  const inboundRows = (await db.prepare(inboundSql).bind(...inboundParams).all()).results || [];
+  if (!inboundRows.length) {
+    return c.json({ data: [] });
+  }
+
+  const inboundIds = inboundRows.map((r: any) => Number(r.inbound_id));
+  const placeholders = inboundIds.map(() => '?').join(', ');
+  const outbounds = (await db.prepare(
+    `SELECT id AS outbound_id, inbound_id, outbound_date, outbound_qty, outbound_weight, remarks, created_by
+     FROM inventory_outbound
+     WHERE inbound_id IN (${placeholders})
+     ORDER BY outbound_date DESC, id DESC`
+  ).bind(...inboundIds).all()).results || [];
+
+  const outMap = new Map<number, any[]>();
+  for (const o of outbounds as any[]) {
+    const key = Number(o.inbound_id);
+    if (!outMap.has(key)) outMap.set(key, []);
+    outMap.get(key)!.push(o);
+  }
+
+  const data = (inboundRows as any[]).map((inb) => {
+    const list = outMap.get(Number(inb.inbound_id)) || [];
+    const totalQty = list.reduce((s, x) => s + Number(x.outbound_qty || 0), 0);
+    const totalWeight = list.reduce((s, x) => s + Number(x.outbound_weight || 0), 0);
+
+    const sortedAsc = [...list].sort((a, b) => String(a.outbound_date || '').localeCompare(String(b.outbound_date || '')));
+    const firstOutboundDate = sortedAsc.length ? sortedAsc[0].outbound_date : null;
+    const lastOutboundDate = sortedAsc.length ? sortedAsc[sortedAsc.length - 1].outbound_date : null;
+
+    return {
+      inbound: {
+        inbound_id: inb.inbound_id,
+        tenant_id: inb.tenant_id,
+        category_id: inb.category_id,
+        category_name: inb.category_name,
+        inbound_date: inb.inbound_date,
+        vehicle_id: inb.vehicle_id,
+        batch_no: inb.batch_no,
+        actual_qty: Number(inb.actual_qty || 0),
+        actual_weight: Number(inb.actual_weight || 0),
+        damage_broken: Number(inb.damage_broken || 0),
+        damage_dirty: Number(inb.damage_dirty || 0),
+        damage_wet: Number(inb.damage_wet || 0),
+        shortage_qty: Number(inb.shortage_qty || 0),
+        extra_qty: Number(inb.extra_qty || 0),
+        rotten_qty: Number(inb.rotten_qty || 0),
+        remarks: inb.remarks,
+        status: inb.status,
+      },
+      outbounds: list.map((o) => ({
+        outbound_id: o.outbound_id,
+        outbound_date: o.outbound_date,
+        outbound_qty: Number(o.outbound_qty || 0),
+        outbound_weight: Number(o.outbound_weight || 0),
+        remarks: o.remarks,
+        created_by: o.created_by,
+      })),
+      outbound_summary: {
+        total_count: list.length,
+        total_qty: totalQty,
+        total_weight: totalWeight,
+        first_outbound_date: firstOutboundDate,
+        last_outbound_date: lastOutboundDate,
+      },
+      remaining: {
+        qty: Number(inb.actual_qty || 0) - totalQty,
+        weight: Number(inb.actual_weight || 0) - totalWeight,
+      },
+    };
+  });
+
+  return c.json({ data });
 });
 
 app.get('/api/v2/history', async (c) => {
@@ -1027,6 +1186,12 @@ app.get('/', (c) => {
     .modal-content { background: white; padding: 24px; border-radius: 8px; width: 90%; max-width: 600px; max-height: 90vh; overflow-y: auto; }
     .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
     .login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+    .row-highlight { animation: rowFlash 2.5s ease; }
+    .status-badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#f5f5f5; color:#666; }
+    @keyframes rowFlash {
+      0% { background-color: #fff7e6; }
+      100% { background-color: transparent; }
+    }
   </style>
 </head>
 <body>
@@ -1034,6 +1199,7 @@ app.get('/', (c) => {
   <script>
     const API_BASE = '/api';
     let token = localStorage.getItem('admin_token');
+    let lastUpdatedInboundId = null;
     
     // 简单的路由
     if (!token) {
@@ -1093,26 +1259,22 @@ app.get('/', (c) => {
             <div class="stat-card"><div class="stat-value" id="totalWeight">-</div><div class="stat-label">总重量(吨)</div></div>
           </div>
           <div class="toolbar">
-            <input type="text" id="searchVehicle" placeholder="搜索车牌号...">
-            <select id="filterBatch">
-              <option value="">全部包装</option>
-              <option value="1号袋">1号袋</option>
-              <option value="2号袋">2号袋</option>
-              <option value="3号袋">3号袋</option>
-            </select>
-            <button class="btn" onclick="loadData()">🔍 查询</button>
+            <span style="color:#666">台账视图（按 Excel：入库 → 出库 → 结余）</span>
+            <button class="btn" onclick="reloadV2Data()">🔄 刷新台账</button>
           </div>
 
           <div class="toolbar">
-            <strong>v2 出库登记</strong>
-            <input type="number" id="v2TenantId" placeholder="tenant" value="1" style="width:90px;">
-            <input type="number" id="v2CategoryId" placeholder="category" style="width:100px;">
-            <input type="text" id="v2BatchNo" placeholder="batch_no">
+            <strong>v2 出库登记（从仍有库存入库中选择）</strong>
+            <input type="number" id="v2TenantId" placeholder="tenant" value="1" style="width:90px;" onchange="reloadV2Data()">
+            <input type="number" id="v2CategoryId" placeholder="category(可选)" style="width:130px;" onchange="reloadV2Data()">
+            <select id="v2InboundSelect" style="min-width:340px;"></select>
+            <input type="date" id="v2OutboundDate" style="width:150px;">
             <input type="number" id="v2OutboundQty" placeholder="出库件数" style="width:110px;">
             <input type="number" id="v2OutboundWeight" placeholder="出库吨数" style="width:110px;">
-            <button class="btn" onclick="createOutboundV2()">提交出库</button>
-            <button class="btn" onclick="loadPendingV2()">刷新待审批</button>
+            <button class="btn" id="v2SubmitBtn" onclick="createOutboundV2()">提交出库</button>
           </div>
+          <div class="toolbar" id="v2InboundHint" style="color:#666; font-size:13px;">加载中...</div>
+          <div class="toolbar" id="v2LimitHint" style="color:#999; font-size:13px;">请选择入库记录后录入出库数量</div>
 
           <div class="table-container" style="margin-bottom:16px;">
             <table>
@@ -1127,15 +1289,17 @@ app.get('/', (c) => {
           <div class="table-container">
             <table>
               <thead>
-                <tr><th>ID</th><th>入库日期</th><th>车号</th><th>包装</th><th>实收件数</th><th>实收吨数</th><th>状态</th><th>操作</th></tr>
+                <tr><th>操作</th><th>入库ID</th><th>入库日期</th><th>车号</th><th>批号</th><th>实收件数</th><th>实收吨数</th><th>出库汇总</th><th>库存件数</th><th>库存吨数</th></tr>
               </thead>
-              <tbody id="tableBody"></tbody>
+              <tbody id="ledgerBody"></tbody>
             </table>
           </div>
         </div>
       \`;
+      document.getElementById('v2OutboundQty')?.addEventListener('input', updateLimitHint);
+      document.getElementById('v2OutboundWeight')?.addEventListener('input', updateLimitHint);
       loadStats();
-      loadData();
+      reloadV2Data();
       loadPendingV2();
     }
     
@@ -1150,57 +1314,156 @@ app.get('/', (c) => {
       document.getElementById('totalWeight').textContent = (data.total_weight || 0).toFixed(2);
     }
     
-    async function loadData() {
-      const vehicle = document.getElementById('searchVehicle')?.value?.trim() || '';
-      const batch = document.getElementById('filterBatch')?.value || '';
-      const params = new URLSearchParams();
-      if (vehicle) params.set('vehicle', vehicle);
-      if (batch) params.set('batch', batch);
+    async function reloadV2Data() {
+      await Promise.all([loadAvailableInboundV2(), loadLedgerV2()]);
+    }
 
-      const url = \`\${API_BASE}/admin/records\${params.toString() ? ('?' + params.toString()) : ''}\`;
-      const res = await fetch(url, {
+    async function loadAvailableInboundV2() {
+      const tenantId = document.getElementById('v2TenantId')?.value || '1';
+      const categoryId = document.getElementById('v2CategoryId')?.value || '';
+      const params = new URLSearchParams({ tenantId });
+      if (categoryId) params.set('categoryId', categoryId);
+
+      const res = await fetch(\`\${API_BASE}/v2/inbound/available?\${params.toString()}\`, {
         headers: { 'Authorization': \`Bearer \${token}\` }
       });
-      const { data } = await res.json();
-      const tbody = document.getElementById('tableBody');
-      tbody.innerHTML = data.map(row => \`
-        <tr>
-          <td>\${row.id}</td>
-          <td>\${row.inbound_date || '-'}</td>
-          <td>\${row.vehicle_id}</td>
-          <td><span class="tag">\${row.package_batch}</span></td>
-          <td>\${row.actual_quantity}</td>
-          <td>\${row.actual_weight}</td>
-          <td><span class="tag \${row.status}">\${row.status === 'pending_review' ? '待复核' : '已确认'}</span></td>
-          <td>
-            \${row.status === 'pending_review' ? 
-              \`<button class="btn btn-success" onclick="approve(\${row.id})" style="padding: 4px 8px; font-size: 12px;">通过</button>
-                <button class="btn btn-danger" onclick="reject(\${row.id})" style="padding: 4px 8px; font-size: 12px;">驳回</button>\` : 
-              '-'
-            }
-          </td>
-        </tr>
-      \`).join('');
+      const payload = await res.json();
+      const data = payload.data || [];
+
+      const select = document.getElementById('v2InboundSelect');
+      const hint = document.getElementById('v2InboundHint');
+      const btn = document.getElementById('v2SubmitBtn');
+      if (!select || !hint || !btn) return;
+
+      if (!data.length) {
+        select.innerHTML = '<option value="">暂无可出库库存</option>';
+        hint.textContent = '当前无可出库库存，请先完成入库或审批。';
+        const limitHint = document.getElementById('v2LimitHint');
+        if (limitHint) limitHint.textContent = '当前无可出库库存，无法录入出库数量';
+        btn.disabled = true;
+        return;
+      }
+
+      select.innerHTML = data.map(row => {
+        const label = \`#\${row.inbound_id} \${row.batch_no || '-'} | 剩余 \${row.remaining_qty || 0}件/\${row.remaining_weight || 0}吨\`;
+        return \`<option value="\${row.inbound_id}" data-qty="\${row.remaining_qty || 0}" data-weight="\${row.remaining_weight || 0}">\${label}</option>\`;
+      }).join('');
+
+      const first = data[0];
+      hint.textContent = \`已加载 \${data.length} 条可出库入库记录，当前选择 #\${first.inbound_id}，剩余 \${first.remaining_qty || 0} 件 / \${first.remaining_weight || 0} 吨。\`;
+      btn.disabled = false;
+      select.onchange = () => {
+        const opt = select.options[select.selectedIndex];
+        hint.textContent = \`当前选择入库 #\${opt.value}，剩余 \${opt.dataset.qty || 0} 件 / \${opt.dataset.weight || 0} 吨。\`;
+        updateLimitHint();
+      };
+      updateLimitHint();
     }
-    
-    async function approve(id) {
-      if (!confirm('确认通过？')) return;
-      await fetch(\`\${API_BASE}/admin/records/\${id}/approve\`, {
-        method: 'POST',
-        headers: { 'Authorization': \`Bearer \${token}\` }
-      });
-      loadData();
-      loadStats();
+
+    function toggleOutboundDetails(inboundId) {
+      const row = document.getElementById(\`detail-row-\${inboundId}\`);
+      if (!row) return;
+      row.style.display = row.style.display === 'none' ? '' : 'none';
     }
-    
-    async function reject(id) {
-      if (!confirm('确认驳回？这将删除记录。')) return;
-      await fetch(\`\${API_BASE}/admin/records/\${id}/reject\`, {
-        method: 'POST',
+
+    function focusInboundRow(inboundId) {
+      const row = document.getElementById(\`inbound-row-\${inboundId}\`);
+      if (!row) return;
+      row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      row.classList.add('row-highlight');
+      setTimeout(() => row.classList.remove('row-highlight'), 2500);
+    }
+
+    function updateLimitHint() {
+      const hint = document.getElementById('v2LimitHint');
+      const option = document.getElementById('v2InboundSelect')?.selectedOptions?.[0];
+      if (!hint || !option) return;
+      const maxQty = Number(option.dataset.qty || 0);
+      const maxWeight = Number(option.dataset.weight || 0);
+      const inputQty = Number(document.getElementById('v2OutboundQty')?.value || 0);
+      const inputWeight = Number(document.getElementById('v2OutboundWeight')?.value || 0);
+      hint.textContent = \`本入库最多可出 \${maxQty} 件 / \${maxWeight} 吨；当前输入 \${inputQty} 件 / \${inputWeight} 吨\`;
+    }
+
+    async function loadLedgerV2() {
+      const tenantId = document.getElementById('v2TenantId')?.value || '1';
+      const categoryId = document.getElementById('v2CategoryId')?.value || '';
+      const params = new URLSearchParams({ tenantId });
+      if (categoryId) params.set('categoryId', categoryId);
+
+      const res = await fetch(\`\${API_BASE}/v2/ledger/inbound-outbound?\${params.toString()}\`, {
         headers: { 'Authorization': \`Bearer \${token}\` }
       });
-      loadData();
-      loadStats();
+      const payload = await res.json();
+      const data = payload.data || [];
+      const tbody = document.getElementById('ledgerBody');
+      if (!tbody) return;
+
+      if (!data.length) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#999;">暂无入库数据</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = data.map(item => {
+        const inbound = item.inbound || {};
+        const outbounds = item.outbounds || [];
+        const summary = item.outbound_summary || {};
+        const remaining = item.remaining || {};
+        const hasOutbound = outbounds.length > 0;
+        const summaryText = hasOutbound
+          ? \`\${summary.total_count || 0}笔 / \${summary.total_qty || 0}件 / \${summary.total_weight || 0}吨\`
+          : '<span class="status-badge">未出库</span>';
+
+        const detailHtml = hasOutbound
+          ? \`
+            <table style="width:100%; border-collapse:collapse; margin-top:8px; font-size:12px;">
+              <thead>
+                <tr style="background:#fafafa;"><th style="padding:8px;">出库ID</th><th style="padding:8px;">出库日期</th><th style="padding:8px;">件数</th><th style="padding:8px;">吨数</th><th style="padding:8px;">备注</th><th style="padding:8px;">操作人</th></tr>
+              </thead>
+              <tbody>
+                \${outbounds.map(o => \`
+                  <tr>
+                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_id}</td>
+                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_date || '-'}</td>
+                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_qty || 0}</td>
+                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.outbound_weight || 0}</td>
+                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.remarks || '-'}</td>
+                    <td style="padding:8px; border-top:1px solid #f0f0f0;">\${o.created_by || '-'}</td>
+                  </tr>
+                \`).join('')}
+              </tbody>
+            </table>
+          \`
+          : \`
+            <div style="margin:8px 0; padding:12px; border:1px dashed #d9d9d9; border-radius:8px; background:#fcfcfc; color:#666;">
+              <div style="font-weight:600; margin-bottom:6px;">该入库记录暂未关联出库记录</div>
+              <div style="font-size:12px; color:#999;">可在上方“出库登记”中选择本入库发起出库</div>
+            </div>
+          \`;
+
+        return \`
+          <tr id="inbound-row-\${inbound.inbound_id}">
+            <td><button class="btn" style="padding:4px 8px;font-size:12px;" onclick="toggleOutboundDetails(\${inbound.inbound_id})">展开</button></td>
+            <td>\${inbound.inbound_id}</td>
+            <td>\${inbound.inbound_date || '-'}</td>
+            <td>\${inbound.vehicle_id || '-'}</td>
+            <td><span class="tag">\${inbound.batch_no || '-'}</span></td>
+            <td>\${inbound.actual_qty || 0}</td>
+            <td>\${inbound.actual_weight || 0}</td>
+            <td>\${summaryText}</td>
+            <td>\${remaining.qty || 0}</td>
+            <td>\${remaining.weight || 0}</td>
+          </tr>
+          <tr id="detail-row-\${inbound.inbound_id}" style="display:none; background:#fff;">
+            <td colspan="10" style="padding:8px 12px;">\${detailHtml}</td>
+          </tr>
+        \`;
+      }).join('');
+
+      if (lastUpdatedInboundId) {
+        focusInboundRow(lastUpdatedInboundId);
+        lastUpdatedInboundId = null;
+      }
     }
 
     async function loadPendingV2() {
@@ -1240,7 +1503,7 @@ app.get('/', (c) => {
         return;
       }
       const urls = data.map(a => \`\${API_BASE}/v2/attachments/file/\${a.r2_key}\`);
-      alert(\`附件数量: \${data.length}\\n\` + urls.join('\\n'));
+      alert(\`附件数量: \${data.length}\n\` + urls.join('\n'));
     }
 
     async function approveV2(id) {
@@ -1248,7 +1511,7 @@ app.get('/', (c) => {
         method: 'POST',
         headers: { 'Authorization': \`Bearer \${token}\` }
       });
-      loadPendingV2();
+      await Promise.all([loadPendingV2(), reloadV2Data(), loadStats()]);
     }
 
     async function rejectV2(id) {
@@ -1256,15 +1519,36 @@ app.get('/', (c) => {
         method: 'POST',
         headers: { 'Authorization': \`Bearer \${token}\` }
       });
-      loadPendingV2();
+      await loadPendingV2();
     }
 
     async function createOutboundV2() {
       const tenant_id = Number(document.getElementById('v2TenantId')?.value || 1);
-      const category_id = Number(document.getElementById('v2CategoryId')?.value || 0);
-      const batch_no = document.getElementById('v2BatchNo')?.value || '';
+      const inbound_id = Number(document.getElementById('v2InboundSelect')?.value || 0);
+      const outbound_date = document.getElementById('v2OutboundDate')?.value || null;
       const outbound_qty = Number(document.getElementById('v2OutboundQty')?.value || 0);
       const outbound_weight = Number(document.getElementById('v2OutboundWeight')?.value || 0);
+
+      if (!inbound_id) {
+        alert('请先从可出库列表选择一条入库记录');
+        return;
+      }
+
+      const option = document.getElementById('v2InboundSelect')?.selectedOptions?.[0];
+      const maxQty = Number(option?.dataset?.qty || 0);
+      const maxWeight = Number(option?.dataset?.weight || 0);
+      if (outbound_qty <= 0) {
+        alert('出库数量必须大于 0');
+        return;
+      }
+      if (outbound_qty > maxQty) {
+        alert(\`出库数量超出上限：最多可出 \${maxQty} 件，当前输入 \${outbound_qty} 件\`);
+        return;
+      }
+      if (outbound_weight > maxWeight) {
+        alert(\`出库吨数超出上限：最多可出 \${maxWeight} 吨，当前输入 \${outbound_weight} 吨\`);
+        return;
+      }
 
       const res = await fetch(\`\${API_BASE}/v2/outbound\`, {
         method: 'POST',
@@ -1272,17 +1556,21 @@ app.get('/', (c) => {
           'Authorization': \`Bearer \${token}\`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ tenant_id, category_id, batch_no, outbound_qty, outbound_weight })
+        body: JSON.stringify({ tenant_id, inbound_id, outbound_qty, outbound_weight, outbound_date })
       });
       const data = await res.json();
       if (!res.ok) {
         alert(data.error || '提交失败');
         return;
       }
-      alert(\`出库成功，ID: \${data.id}\`);
-      loadStats();
+      alert(\`出库登记成功（出库ID: \${data.id}），剩余 \${data.remaining_qty} 件 / \${data.remaining_weight} 吨\`);
+      document.getElementById('v2OutboundQty').value = '';
+      document.getElementById('v2OutboundWeight').value = '';
+      lastUpdatedInboundId = inbound_id;
+      await Promise.all([reloadV2Data(), loadStats()]);
+      updateLimitHint();
     }
-    
+
     function logout() {
       localStorage.removeItem('admin_token');
       location.reload();

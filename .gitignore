@@ -1,0 +1,26 @@
+# 敏感文件
+CREDENTIALS.md
+.env
+.env.local
+*.pem
+*.key
+
+# 依赖和构建产物
+node_modules/
+dist/
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 临时文件
+*.tmp
+*.temp
+.cache/

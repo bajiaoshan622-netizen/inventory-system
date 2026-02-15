@@ -2531,6 +2531,194 @@ app.post("/api/upload/url", apiKeyAuth, async (c) => {
   });
 });
 app.get("/api/health", (c) => c.json({ status: "ok" }));
+app.get("/", (c) => {
+  return c.html(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>\u5E93\u5B58\u7BA1\u7406\u7CFB\u7EDF - \u7BA1\u7406\u5458</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+    .header { background: white; padding: 16px 24px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .header h1 { font-size: 20px; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+    .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .stat-value { font-size: 28px; font-weight: 600; color: #1890ff; }
+    .stat-label { font-size: 14px; color: #666; margin-top: 4px; }
+    .toolbar { background: white; padding: 16px; border-radius: 8px; margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; }
+    input, select, button { padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; }
+    .btn { background: #1890ff; color: white; border: none; cursor: pointer; }
+    .btn-danger { background: #ff4d4f; }
+    .btn-success { background: #52c41a; }
+    .table-container { background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #f0f0f0; }
+    th { background: #fafafa; }
+    .tag { padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #e6f7ff; color: #1890ff; }
+    .tag.pending { background: #fff7e6; color: #fa8c16; }
+    .tag.approved { background: #f6ffed; color: #52c41a; }
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 100; }
+    .modal.show { display: flex; align-items: center; justify-content: center; }
+    .modal-content { background: white; padding: 24px; border-radius: 8px; width: 90%; max-width: 600px; max-height: 90vh; overflow-y: auto; }
+    .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    const API_BASE = '/api';
+    let token = localStorage.getItem('admin_token');
+    
+    // \u7B80\u5355\u7684\u8DEF\u7531
+    if (!token) {
+      showLogin();
+    } else {
+      showMain();
+    }
+    
+    function showLogin() {
+      document.getElementById('app').innerHTML = \`
+        <div class="login-container">
+          <div class="login-box">
+            <h2 style="margin-bottom: 24px; text-align: center;">\u{1F510} \u7BA1\u7406\u5458\u767B\u5F55</h2>
+            <form id="loginForm">
+              <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 8px; font-size: 14px; color: #666;">\u5BC6\u7801</label>
+                <input type="password" id="password" placeholder="\u8BF7\u8F93\u5165\u5BC6\u7801" required style="width: 100%;">
+              </div>
+              <button type="submit" class="btn" style="width: 100%;">\u767B\u5F55</button>
+            </form>
+          </div>
+        </div>
+      \`;
+      
+      document.getElementById('loginForm').onsubmit = async (e) => {
+        e.preventDefault();
+        const password = document.getElementById('password').value;
+        const res = await fetch(\`\${API_BASE}/auth/login\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (data.token) {
+          token = data.token;
+          localStorage.setItem('admin_token', token);
+          showMain();
+        } else {
+          alert('\u5BC6\u7801\u9519\u8BEF');
+        }
+      };
+    }
+    
+    function showMain() {
+      document.getElementById('app').innerHTML = \`
+        <div class="container">
+          <div class="header">
+            <h1>\u{1F4E6} \u5E93\u5B58\u7BA1\u7406\u7CFB\u7EDF</h1>
+            <div>
+              <button class="btn btn-danger" onclick="logout()">\u9000\u51FA</button>
+            </div>
+          </div>
+          <div class="stats">
+            <div class="stat-card"><div class="stat-value" id="totalCount">-</div><div class="stat-label">\u603B\u8BB0\u5F55\u6570</div></div>
+            <div class="stat-card"><div class="stat-value" id="pendingCount" style="color: #fa8c16;">-</div><div class="stat-label">\u5F85\u590D\u6838</div></div>
+            <div class="stat-card"><div class="stat-value" id="approvedCount" style="color: #52c41a;">-</div><div class="stat-label">\u5DF2\u786E\u8BA4</div></div>
+            <div class="stat-card"><div class="stat-value" id="totalWeight">-</div><div class="stat-label">\u603B\u91CD\u91CF(\u5428)</div></div>
+          </div>
+          <div class="toolbar">
+            <input type="text" id="searchVehicle" placeholder="\u641C\u7D22\u8F66\u724C\u53F7...">
+            <select id="filterBatch">
+              <option value="">\u5168\u90E8\u5305\u88C5</option>
+              <option value="1\u53F7\u888B">1\u53F7\u888B</option>
+              <option value="2\u53F7\u888B">2\u53F7\u888B</option>
+              <option value="3\u53F7\u888B">3\u53F7\u888B</option>
+            </select>
+            <button class="btn" onclick="loadData()">\u{1F50D} \u67E5\u8BE2</button>
+          </div>
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr><th>ID</th><th>\u5165\u5E93\u65E5\u671F</th><th>\u8F66\u53F7</th><th>\u5305\u88C5</th><th>\u5B9E\u6536\u4EF6\u6570</th><th>\u5B9E\u6536\u5428\u6570</th><th>\u72B6\u6001</th><th>\u64CD\u4F5C</th></tr>
+              </thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      \`;
+      loadStats();
+      loadData();
+    }
+    
+    async function loadStats() {
+      const res = await fetch(\`\${API_BASE}/admin/stats\`, {
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      const data = await res.json();
+      document.getElementById('totalCount').textContent = data.total_records || 0;
+      document.getElementById('pendingCount').textContent = data.pending_count || 0;
+      document.getElementById('approvedCount').textContent = data.approved_count || 0;
+      document.getElementById('totalWeight').textContent = (data.total_weight || 0).toFixed(2);
+    }
+    
+    async function loadData() {
+      const res = await fetch(\`\${API_BASE}/admin/records\`, {
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      const { data } = await res.json();
+      const tbody = document.getElementById('tableBody');
+      tbody.innerHTML = data.map(row => \`
+        <tr>
+          <td>\${row.id}</td>
+          <td>\${row.inbound_date || '-'}</td>
+          <td>\${row.vehicle_id}</td>
+          <td><span class="tag">\${row.package_batch}</span></td>
+          <td>\${row.actual_quantity}</td>
+          <td>\${row.actual_weight}</td>
+          <td><span class="tag \${row.status}">\${row.status === 'pending_review' ? '\u5F85\u590D\u6838' : '\u5DF2\u786E\u8BA4'}</span></td>
+          <td>
+            \${row.status === 'pending_review' ? 
+              \`<button class="btn btn-success" onclick="approve(\${row.id})" style="padding: 4px 8px; font-size: 12px;">\u901A\u8FC7</button>
+                <button class="btn btn-danger" onclick="reject(\${row.id})" style="padding: 4px 8px; font-size: 12px;">\u9A73\u56DE</button>\` : 
+              '-'
+            }
+          </td>
+        </tr>
+      \`).join('');
+    }
+    
+    async function approve(id) {
+      if (!confirm('\u786E\u8BA4\u901A\u8FC7\uFF1F')) return;
+      await fetch(\`\${API_BASE}/admin/records/\${id}/approve\`, {
+        method: 'POST',
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      loadData();
+      loadStats();
+    }
+    
+    async function reject(id) {
+      if (!confirm('\u786E\u8BA4\u9A73\u56DE\uFF1F\u8FD9\u5C06\u5220\u9664\u8BB0\u5F55\u3002')) return;
+      await fetch(\`\${API_BASE}/admin/records/\${id}/reject\`, {
+        method: 'POST',
+        headers: { 'Authorization': \`Bearer \${token}\` }
+      });
+      loadData();
+      loadStats();
+    }
+    
+    function logout() {
+      localStorage.removeItem('admin_token');
+      location.reload();
+    }
+  </script>
+</body>
+</html>`);
+});
 var index_default = app;
 export {
   index_default as default

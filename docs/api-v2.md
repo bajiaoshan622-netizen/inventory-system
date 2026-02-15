@@ -1,88 +1,177 @@
 # API: Inventory v2（多客户 + 通用货类 + 入出库）
 
 ## 1. Background
-v1 仅覆盖部分入库流程。v2 需要支持：多客户隔离、通用货类、管理员直登入/出库、Agent 提交待审批、库存强校验、异常字段后补与审计。
+v2 进入 UI/UX 质量整改阶段，目标是与用户 Excel 台账的认知模型对齐：按“入库主记录 + 对应出库信息”直观展示，并保证出库必须从“仍有库存”的入库记录发起。
 
 ## 2. Goals / Non-Goals
 ### Goals
 - 多客户（tenant）隔离
 - 通用货类（category）
-- 入库/出库双流水
-- 管理员直登免审批；Agent 需审批
-- 坏/污/湿/短/多/烂字段可后补
+- 入库与出库建立可追溯关联（`inbound_id`）
+- 管理员直登入/出库；Agent 提交待审批
+- 提供“台账视图”API：未出库时出库字段为空
+- 出库只能基于仍有库存的入库记录发起
 
 ### Non-Goals
 - 不做财务对账系统
 - 不做第三方 ERP 同步
 
-## 3. Data Structures
+## 3. Data Structures & Constraints
 
 ### 3.1 主表
-- `tenants(id, name, status, created_at)`
-- `categories(id, tenant_id, code, name, field_schema_json, active)`
-- `inventory_inbound(id, tenant_id, category_id, batch_no, vehicle_id, inbound_date, actual_qty, actual_weight, damage_broken, damage_dirty, damage_wet, shortage_qty, extra_qty, rotten_qty, status, source, created_by, approved_by, approved_at, updated_at)`
-- `inventory_outbound(id, tenant_id, category_id, batch_no, outbound_date, outbound_qty, outbound_weight, status, source, created_by, approved_by, approved_at, updated_at)`
-- `inventory_balance(id, tenant_id, category_id, batch_no, available_qty, available_weight, updated_at)`
-- `record_history(id, tenant_id, record_type, record_id, action, before_json, after_json, operator, created_at)`
-- `attachments(id, tenant_id, record_type, record_id, r2_key, file_name, file_size, uploader, created_at)`
+- `inventory_inbound`
+  - 核心：`tenant_id, category_id, batch_no, inbound_date, actual_qty, actual_weight`
+  - 异常：`damage_broken, damage_dirty, damage_wet, shortage_qty, extra_qty, rotten_qty`
+  - 状态：`pending_review | approved | rejected`
+- `inventory_outbound`
+  - 约束字段：`inbound_id`（关联入库记录）
+  - 核心：`tenant_id, category_id, batch_no, outbound_date, outbound_qty, outbound_weight`
+  - 状态：`approved`
 
-### 3.2 状态机
-- 管理员创建：`approved`（直接生效）
-- Agent 创建/更新：`pending_review` -> 管理员审批 -> `approved`
-- 拒绝：`rejected`
+### 3.2 关联与一致性
+1. `inventory_outbound.inbound_id` 必须指向同 tenant 下的已审批入库单
+2. 出库时 `category_id/batch_no` 必须与被选入库一致（服务端兜底写入）
+3. 同一入库允许多次出库（1:N）
+4. 入库剩余量：
+   - `remaining_qty = inbound.actual_qty - SUM(outbound.outbound_qty)`
+   - `remaining_weight = inbound.actual_weight - SUM(outbound.outbound_weight)`
 
-## 4. Core Rules
-1. 可用件数：`available_qty = 实收件数累计 - 已出库件数累计`
-2. 出库校验：`requested_outbound_qty <= available_qty`
-3. 异常字段后补允许，但必须写 `record_history`
-4. Agent 入库附件必传；管理员可选
+### 3.3 Excel 规则落地
+- 台账主视图字段（按 Excel 习惯）：
+  - 入库区：入库日期、车号/箱号、包装/批号、实收件数/吨数、破/污/湿/短/多/烂、提单号、合同号、备注
+  - 出库区：出库日期、出库件数、出库吨数
+  - 结余区：库存件数、库存吨数
+- 若无出库记录：`outbounds=[]`，`outbound_summary.total_count=0`，`outbound_summary.first_outbound_date=null`
 
-## 5. API Contract（草案）
+## 4. Flows & State Machine
+1. 入库创建
+   - Admin：直接 `approved`，计入库存
+   - Agent：`pending_review`，审批后计入库存
+2. 出库创建
+   - Admin 在“可出库入库池”中选中某条入库（`remaining_qty > 0`）
+   - 填写出库日期、件数、吨数、备注后提交
+   - 服务端校验剩余量后写入 `inventory_outbound` 并扣减 `inventory_balance`
+3. 台账查询
+   - 按 tenant/category 返回“inbound 主体 + outbounds[] + outbound_summary + remaining”
 
-### 5.1 Tenant / Category
-- `GET /api/v2/tenants`
-- `GET /api/v2/categories?tenantId=...`
-- `POST /api/v2/categories`（管理员）
+## 5. API Contract
 
-### 5.2 Inbound
-- `POST /api/v2/inbound`（管理员直生效 / Agent待审批）
-- `PUT /api/v2/inbound/:id`（管理员可改；Agent改走待审批）
-- `GET /api/v2/inbound`
-- `POST /api/v2/inbound/:id/approve`（管理员）
-- `POST /api/v2/inbound/:id/reject`（管理员）
+### 5.1 Inbound
+- `GET /api/v2/inbound?tenantId=&status=&categoryId=&page=&limit=`
+- `GET /api/v2/inbound/available?tenantId=&categoryId=`
+  - 仅返回可出库入库记录（`status=approved 且 remaining_qty>0`）
 
-### 5.3 Outbound
+### 5.2 Outbound
 - `POST /api/v2/outbound`（仅管理员）
-- `PUT /api/v2/outbound/:id`（管理员）
-- `GET /api/v2/outbound`
+  - 请求：`tenant_id, inbound_id, outbound_qty, outbound_weight, outbound_date?, remarks?`
+  - 行为：服务端自动继承被选入库 `category_id/batch_no`
 
-### 5.4 Balance / History / Attachments
-- `GET /api/v2/balance?tenantId=&categoryId=&batchNo=`
-- `GET /api/v2/history?recordType=&recordId=`
-- `POST /api/v2/attachments/upload-url`
-- `PUT /api/v2/attachments/upload/*`
+### 5.3 Ledger（Excel式台账）
+- `GET /api/v2/ledger/inbound-outbound?tenantId=&categoryId=`
+
+返回结构示例（必须遵循）：
+```json
+{
+  "data": [
+    {
+      "inbound": {
+        "inbound_id": 101,
+        "tenant_id": 1,
+        "category_id": 3,
+        "category_name": "50KG氢钙3号袋",
+        "inbound_date": "2026-02-15",
+        "vehicle_id": "桂E31508",
+        "batch_no": "TB2601001",
+        "actual_qty": 700,
+        "actual_weight": 35,
+        "damage_broken": 0,
+        "damage_dirty": 0,
+        "damage_wet": 0,
+        "shortage_qty": 0,
+        "extra_qty": 0,
+        "rotten_qty": 0,
+        "remarks": null,
+        "status": "approved"
+      },
+      "outbounds": [
+        {
+          "outbound_id": 501,
+          "outbound_date": "2026-02-16",
+          "outbound_qty": 400,
+          "outbound_weight": 20,
+          "remarks": "一柜",
+          "created_by": "admin"
+        },
+        {
+          "outbound_id": 502,
+          "outbound_date": "2026-02-18",
+          "outbound_qty": 200,
+          "outbound_weight": 10,
+          "remarks": "二柜",
+          "created_by": "admin"
+        }
+      ],
+      "outbound_summary": {
+        "total_count": 2,
+        "total_qty": 600,
+        "total_weight": 30,
+        "first_outbound_date": "2026-02-16",
+        "last_outbound_date": "2026-02-18"
+      },
+      "remaining": {
+        "qty": 100,
+        "weight": 5
+      }
+    },
+    {
+      "inbound": {
+        "inbound_id": 102,
+        "tenant_id": 1,
+        "category_id": 3,
+        "category_name": "50KG氢钙3号袋",
+        "inbound_date": "2026-02-20",
+        "vehicle_id": "桂E61656",
+        "batch_no": "TB2601002",
+        "actual_qty": 700,
+        "actual_weight": 35,
+        "status": "approved"
+      },
+      "outbounds": [],
+      "outbound_summary": {
+        "total_count": 0,
+        "total_qty": 0,
+        "total_weight": 0,
+        "first_outbound_date": null,
+        "last_outbound_date": null
+      },
+      "remaining": {
+        "qty": 700,
+        "weight": 35
+      }
+    }
+  ]
+}
+```
 
 ## 6. Error Model
-- `400` 参数错误
+- `400` 参数错误（缺 inbound_id、出库件数<=0 等）
 - `401` 认证失败
 - `403` 权限不足
-- `404` 资源不存在
-- `409` 库存冲突（出库超量 / 并发修改）
+- `404` 入库记录不存在
+- `409` 库存冲突（出库超量 / 入库不在可出库状态）
 
-## 7. Migration（v1 -> v2）
-1. 新建 v2 表，不直接改写 v1 表
-2. 将 v1 记录映射到默认 tenant + 对应 category
-3. 回填 `inventory_balance`
-4. 灰度切流后冻结 v1 写入
+## 7. Verification
+- [ ] 每条入库记录可追溯其出库记录（含 0 条）
+- [ ] ledger 返回含 `inbound/outbounds/outbound_summary/remaining`
+- [ ] 可出库列表仅显示仍有库存入库
+- [ ] 出库接口仅允许从可出库入库发起
+- [ ] 超量出库返回 409
+- [ ] UI 可直接消费 outbounds[] 渲染主行展开明细
 
-## 8. Verification
-- [ ] 管理员入库直接可见且计入库存
-- [ ] Agent 入库需审批后才计入库存
-- [ ] 出库超量返回 409
-- [ ] 异常字段后补留痕
-- [ ] tenant 数据隔离
-
-## 9. Change Log
+## 8. Change Log
 | 日期 | 变更 | 作者 |
 |---|---|---|
+| 2026-02-15 | 实现收口：ledger 接口输出嵌套结构并供 UI 展开消费 | 光年 |
+| 2026-02-15 | 增加 ledger JSON 结构示例（inbound/outbounds/summary/remaining） | 光年 |
+| 2026-02-15 | 补充 inbound-outbound 关联与台账视图规则；明确可出库池与校验 | 光年 |
 | 2026-02-15 | v2 API 设计初稿 | 光年 |

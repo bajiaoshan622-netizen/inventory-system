@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS inventory_inbound (
 CREATE TABLE IF NOT EXISTS inventory_outbound (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id INTEGER NOT NULL,
+  inbound_id INTEGER,
   category_id INTEGER NOT NULL,
   batch_no TEXT,
   outbound_date TEXT,
@@ -144,6 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_categories_tenant ON categories(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_tenant_category ON inventory_inbound(tenant_id, category_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_status ON inventory_inbound(status);
 CREATE INDEX IF NOT EXISTS idx_outbound_tenant_category ON inventory_outbound(tenant_id, category_id);
+CREATE INDEX IF NOT EXISTS idx_outbound_inbound ON inventory_outbound(inbound_id);
 CREATE INDEX IF NOT EXISTS idx_balance_tenant_category ON inventory_balance(tenant_id, category_id);
 CREATE INDEX IF NOT EXISTS idx_history_record ON record_history(record_type, record_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_record ON attachments(record_type, record_id);
